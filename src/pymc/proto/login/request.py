@@ -44,43 +44,94 @@ def encode_offline(
     identity_data: IdentityData,
     client_data: ClientData,
     private_key: ec.EllipticCurvePrivateKey,
+    legacy: bool = False,
 ) -> bytes:
     """Create a self-signed login request for offline mode.
+
+    Mirrors gophertunnel's EncodeOffline. When legacy=False (default,
+    for protocol >= 1.26.10), produces the new OIDC multiplayer token
+    format. When legacy=True, produces the old extraData chain format.
 
     Returns the connection_request bytes for the Login packet.
     """
     public_key_b64 = marshal_public_key(private_key.public_key())
     now = int(time.time())
 
-    # Build identity JWT with extraData.
+    signer_headers = {"x5u": public_key_b64}
+    claims_base = {
+        "nbf": now - 21600,  # 6 hours ago
+        "exp": now + 21600,  # 6 hours from now
+    }
+
+    # Build identity chain JWT with extraData (used by BDS to extract XUID).
+    identity_id = identity_data.identity or str(uuid.uuid4())
     identity_claims = {
-        "nbf": now - 60,
-        "exp": now + 3600,
-        "iat": now,
-        "iss": "self",
+        **claims_base,
         "extraData": {
             "XUID": identity_data.xuid,
-            "identity": identity_data.identity or str(uuid.uuid4()),
+            "identity": identity_id,
             "displayName": identity_data.display_name,
             "titleId": identity_data.title_id,
         },
         "identityPublicKey": public_key_b64,
-        "randomNonce": now,
     }
-
-    identity_token = jwt.encode(
-        identity_claims,
-        private_key,
-        algorithm="ES384",
-        headers={"x5u": public_key_b64},
+    chain_jwt = jwt.encode(
+        identity_claims, private_key,
+        algorithm="ES384", headers=signer_headers,
     )
 
-    # Build chain.
-    chain = {"chain": [identity_token]}
-    chain_json = json.dumps(chain).encode()
+    if legacy:
+        # Legacy format: just {"chain":["<jwt>"]} (pre-1.26.10)
+        request_obj = {"chain": [chain_jwt]}
+    else:
+        # New format: OIDC multiplayer token (1.26.10+)
+        # Certificate is a stringified JSON string (double-encoded).
+        # Include the identity chain so BDS can extract XUID from extraData.
+        token_claims = {
+            **claims_base,
+            "cpk": public_key_b64,
+            "xid": identity_data.xuid,
+            "xname": identity_data.display_name,
+            "identity": identity_id,
+        }
+        if identity_data.playfab_id:
+            token_claims["mid"] = identity_data.playfab_id
+        if identity_data.playfab_title_id:
+            token_claims["tid"] = identity_data.playfab_title_id
 
-    # Build client data JWT.
-    client_dict = {
+        token_jwt = jwt.encode(
+            token_claims, private_key,
+            algorithm="ES384", headers=signer_headers,
+        )
+        cert_json = json.dumps({"chain": [chain_jwt]}, separators=(",", ":"))
+        request_obj = {
+            "Certificate": cert_json,  # String, not object
+            "AuthenticationType": 2,
+            "Token": token_jwt,
+        }
+
+    # Client data JWT (RawToken)
+    client_dict = _build_client_dict(client_data)
+    raw_token = jwt.encode(
+        client_dict, private_key,
+        algorithm="ES384", headers=signer_headers,
+    )
+
+    # Assemble: [request_json_len:le32][request_json][raw_token_len:le32][raw_token]
+    request_json = json.dumps(request_obj, separators=(",", ":")).encode()
+    raw_token_bytes = raw_token.encode() if isinstance(raw_token, str) else raw_token
+
+    result = bytearray()
+    result.extend(struct.pack("<i", len(request_json)))
+    result.extend(request_json)
+    result.extend(struct.pack("<i", len(raw_token_bytes)))
+    result.extend(raw_token_bytes)
+    return bytes(result)
+
+
+def _build_client_dict(client_data: ClientData) -> dict:
+    """Build client data claims dictionary for JWT."""
+    return {
         "GameVersion": client_data.game_version,
         "ServerAddress": client_data.server_address,
         "LanguageCode": client_data.language_code,
@@ -119,22 +170,6 @@ def encode_offline(
         "MaxViewDistance": client_data.max_view_distance,
         "MemoryTier": client_data.memory_tier,
     }
-
-    client_token = jwt.encode(
-        client_dict,
-        private_key,
-        algorithm="ES384",
-        headers={"x5u": public_key_b64},
-    )
-    client_token_bytes = client_token.encode()
-
-    # Assemble: [chain_len:le32][chain_json][client_len:le32][client_jwt]
-    result = bytearray()
-    result.extend(struct.pack("<I", len(chain_json)))
-    result.extend(chain_json)
-    result.extend(struct.pack("<I", len(client_token_bytes)))
-    result.extend(client_token_bytes)
-    return bytes(result)
 
 
 def encode_authenticated(

@@ -151,7 +151,9 @@ def encode_batch(
             # Below threshold: no compression, but mark as uncompressed.
             result.append(COMPRESSION_NONE)
         elif compression == COMPRESSION_FLATE:
-            data = zlib.compress(data)
+            # Raw deflate (no zlib header) — matches gophertunnel's compress/flate
+            compressor = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
+            data = compressor.compress(data) + compressor.flush()
             result.append(COMPRESSION_FLATE)
         elif compression == COMPRESSION_SNAPPY:
             try:
@@ -194,7 +196,8 @@ def decode_batch(
         if comp_id == COMPRESSION_NONE:
             pass  # No compression
         elif comp_id == COMPRESSION_FLATE:
-            data = zlib.decompress(data, bufsize=max_decompressed)
+            # Raw deflate (no zlib header) — wbits=-15
+            data = zlib.decompress(data, -15, max_decompressed)
         elif comp_id == COMPRESSION_SNAPPY:
             try:
                 import snappy

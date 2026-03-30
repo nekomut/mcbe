@@ -48,7 +48,7 @@ from pymc.proto.pool import Packet, server_pool
 logger = logging.getLogger(__name__)
 
 # Current protocol version.
-PROTOCOL_VERSION = 729
+PROTOCOL_VERSION = 944
 
 
 class Dialer:
@@ -71,13 +71,14 @@ class Dialer:
         flush_rate: float = 0.05,
         chunk_radius: int = 16,
         network: Network | None = None,
+        legacy_login: bool = False,
     ) -> None:
         self.identity_data = identity_data or IdentityData(
             display_name="Steve",
             identity=str(uuid.uuid4()),
         )
         self.client_data = client_data or ClientData(
-            game_version="1.21.50",
+            game_version="1.26.11",
             language_code="en_US",
             device_os=7,  # Windows 10
             device_model="pymc",
@@ -86,6 +87,7 @@ class Dialer:
         self.protocol_version = protocol_version
         self.flush_rate = flush_rate
         self.chunk_radius = chunk_radius
+        self.legacy_login = legacy_login
         self._network = network or TCPNetwork()
 
     async def dial(self, address: str) -> Connection:
@@ -131,7 +133,8 @@ class Dialer:
         # 3. Send Login.
         self.client_data.server_address = ""
         connection_request = encode_offline(
-            self.identity_data, self.client_data, private_key
+            self.identity_data, self.client_data, private_key,
+            legacy=self.legacy_login,
         )
         await conn.write_packet(
             Login(
@@ -141,15 +144,22 @@ class Dialer:
         )
         await conn.flush()
 
-        # 4. Wait for ServerToClientHandshake → enable encryption.
+        # 4. Wait for ServerToClientHandshake or PlayStatus.
+        # Servers with authentication disabled skip the handshake and send
+        # PlayStatus directly.
         from pymc.proto.packet.handshake import ServerToClientHandshake
+        from pymc.proto.packet.play_status import PlayStatus
 
-        pk = await self._expect(conn, ServerToClientHandshake, timeout=10.0)
-        await self._handle_encryption(conn, pk, private_key)
+        pk = await self._expect_any(
+            conn, (ServerToClientHandshake, PlayStatus), timeout=10.0
+        )
 
-        # 5. Send ClientToServerHandshake.
-        await conn.write_packet(ClientToServerHandshake())
-        await conn.flush()
+        if isinstance(pk, ServerToClientHandshake):
+            await self._handle_encryption(conn, pk, private_key)
+
+            # 5. Send ClientToServerHandshake.
+            await conn.write_packet(ClientToServerHandshake())
+            await conn.flush()
 
         # 6. Handle resource packs.
         await self._handle_resource_packs(conn)
@@ -256,5 +266,18 @@ class Dialer:
         while True:
             pk = await asyncio.wait_for(conn.read_packet(), timeout=timeout)
             if isinstance(pk, packet_type):
+                return pk
+            logger.debug("skipping unexpected packet: %s", type(pk).__name__)
+
+    @staticmethod
+    async def _expect_any(
+        conn: Connection,
+        packet_types: tuple[type[Packet], ...],
+        timeout: float = 10.0,
+    ) -> Packet:
+        """Read packets until we get one of the expected types."""
+        while True:
+            pk = await asyncio.wait_for(conn.read_packet(), timeout=timeout)
+            if isinstance(pk, packet_types):
                 return pk
             logger.debug("skipping unexpected packet: %s", type(pk).__name__)

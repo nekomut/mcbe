@@ -80,6 +80,9 @@ class RakNetNetwork(Network):
             # Send ConnectionRequest
             await self._send_connection_request(conn)
 
+            # Wait for ConnectionRequestAccepted + NewIncomingConnection
+            await asyncio.wait_for(conn._connected.wait(), timeout=5.0)
+
             return conn
 
         except Exception:

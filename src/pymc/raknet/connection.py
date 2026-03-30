@@ -151,6 +151,9 @@ class RakNetClientConnection(NetworkConnection):
         # Game packet queue (ready for application to consume)
         self._game_packets: asyncio.Queue[bytes] = asyncio.Queue()
 
+        # Online handshake completion event
+        self._connected = asyncio.Event()
+
         # Background tasks
         self._recv_task: asyncio.Task[None] | None = None
         self._tick_task: asyncio.Task[None] | None = None
@@ -270,7 +273,8 @@ class RakNetClientConnection(NetworkConnection):
             logger.info("Server sent disconnect notification")
             self._closed = True
         elif packet_id == GAME_PACKET:
-            self._game_packets.put_nowait(data[1:])
+            # Pass full data including 0xFE header for decode_batch
+            self._game_packets.put_nowait(data)
         elif packet_id == CONNECTION_REQUEST_ACCEPTED:
             self._handle_connection_accepted(data)
 
@@ -305,6 +309,7 @@ class RakNetClientConnection(NetworkConnection):
         payload += struct.pack(">q", _current_time_ms())
         payload += struct.pack(">q", _current_time_ms())
         self._send_frame(payload)
+        self._connected.set()
 
     def _send_frame(self, data: bytes, reliability: int = RELIABLE_ORDERED) -> None:
         """Send data as a reliable ordered frame."""
@@ -377,11 +382,10 @@ class RakNetClientConnection(NetworkConnection):
         return await self._game_packets.get()
 
     async def write_packet(self, data: bytes) -> None:
-        """Write a game packet (will be sent as 0xFE frame)."""
+        """Write a game packet. Data must already start with 0xFE batch header."""
         if self._closed:
             raise ConnectionError("Connection is closed")
-        payload = struct.pack("B", GAME_PACKET) + data
-        self._send_frame(payload)
+        self._send_frame(data)
 
     async def close(self) -> None:
         """Close the connection."""
@@ -493,7 +497,8 @@ class RakNetServerConnection(NetworkConnection):
         elif packet_id == DISCONNECTION_NOTIFICATION:
             self._closed = True
         elif packet_id == GAME_PACKET:
-            self._game_packets.put_nowait(data[1:])
+            # Pass full data including 0xFE header for decode_batch
+            self._game_packets.put_nowait(data)
 
     def _handle_connection_request(self, data: bytes) -> None:
         """Handle ConnectionRequest and send ConnectionRequestAccepted."""
@@ -589,8 +594,7 @@ class RakNetServerConnection(NetworkConnection):
     async def write_packet(self, data: bytes) -> None:
         if self._closed:
             raise ConnectionError("Connection is closed")
-        payload = struct.pack("B", GAME_PACKET) + data
-        self._send_frame(payload)
+        self._send_frame(data)
 
     async def close(self) -> None:
         if self._closed:
