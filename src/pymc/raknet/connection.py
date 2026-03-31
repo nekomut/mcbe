@@ -27,6 +27,7 @@ from pymc.raknet.protocol import (
     GAME_PACKET,
     NACK,
     NEW_INCOMING_CONNECTION,
+    ORDERED_TYPES,
     OPEN_CONNECTION_REPLY_1,
     OPEN_CONNECTION_REPLY_2,
     OPEN_CONNECTION_REQUEST_1,
@@ -144,9 +145,9 @@ class RakNetClientConnection(NetworkConnection):
         # Fragment reassembly
         self._fragments: dict[int, _FragmentBuffer] = {}
 
-        # Ordered packet queue
-        self._ordered_queue: dict[int, bytes] = {}
-        self._ordered_read_index: int = 0
+        # Ordered packet queue: per-channel buffer + read index
+        self._ordered_queue: dict[int, dict[int, bytes]] = {}
+        self._ordered_read_index: dict[int, int] = {}
 
         # Game packet queue (ready for application to consume)
         self._game_packets: asyncio.Queue[bytes] = asyncio.Queue()
@@ -252,12 +253,40 @@ class RakNetClientConnection(NetworkConnection):
                 buf = _FragmentBuffer(compound_size=frame.compound_size)
                 self._fragments[frame.compound_id] = buf
             reassembled = buf.add(frame.fragment_index, frame.body)
-            if reassembled is not None:
-                del self._fragments[frame.compound_id]
+            if reassembled is None:
+                return
+            # Use the fragment's ordering info for the reassembled payload.
+            if frame.reliability in ORDERED_TYPES:
+                self._handle_ordered(frame.order_channel, frame.ordered_index, reassembled)
+            else:
                 self._process_payload(reassembled)
             return
 
-        self._process_payload(frame.body)
+        if frame.reliability in ORDERED_TYPES:
+            self._handle_ordered(frame.order_channel, frame.ordered_index, frame.body)
+        else:
+            self._process_payload(frame.body)
+
+    def _handle_ordered(self, channel: int, index: int, data: bytes) -> None:
+        """Buffer and process ordered frames in sequence."""
+        expected = self._ordered_read_index.get(channel, 0)
+
+        if index == expected:
+            self._process_payload(data)
+            expected += 1
+            # Flush any buffered frames that are now in order.
+            buf = self._ordered_queue.get(channel)
+            if buf is not None:
+                while expected in buf:
+                    self._process_payload(buf.pop(expected))
+                    expected += 1
+                if not buf:
+                    del self._ordered_queue[channel]
+            self._ordered_read_index[channel] = expected
+        elif index > expected:
+            buf = self._ordered_queue.setdefault(channel, {})
+            buf[index] = data
+        # index < expected: duplicate, ignore
 
     def _process_payload(self, data: bytes) -> None:
         """Process a complete payload (after reassembly)."""
@@ -441,6 +470,10 @@ class RakNetServerConnection(NetworkConnection):
         # Fragment reassembly
         self._fragments: dict[int, _FragmentBuffer] = {}
 
+        # Ordered packet queue: per-channel buffer + read index
+        self._ordered_queue: dict[int, dict[int, bytes]] = {}
+        self._ordered_read_index: dict[int, int] = {}
+
         # Game packet queue
         self._game_packets: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -475,11 +508,37 @@ class RakNetServerConnection(NetworkConnection):
                 buf = _FragmentBuffer(compound_size=frame.compound_size)
                 self._fragments[frame.compound_id] = buf
             reassembled = buf.add(frame.fragment_index, frame.body)
-            if reassembled is not None:
-                del self._fragments[frame.compound_id]
+            if reassembled is None:
+                return
+            if frame.reliability in ORDERED_TYPES:
+                self._handle_ordered(frame.order_channel, frame.ordered_index, reassembled)
+            else:
                 self._process_payload(reassembled)
             return
-        self._process_payload(frame.body)
+
+        if frame.reliability in ORDERED_TYPES:
+            self._handle_ordered(frame.order_channel, frame.ordered_index, frame.body)
+        else:
+            self._process_payload(frame.body)
+
+    def _handle_ordered(self, channel: int, index: int, data: bytes) -> None:
+        """Buffer and process ordered frames in sequence."""
+        expected = self._ordered_read_index.get(channel, 0)
+
+        if index == expected:
+            self._process_payload(data)
+            expected += 1
+            buf = self._ordered_queue.get(channel)
+            if buf is not None:
+                while expected in buf:
+                    self._process_payload(buf.pop(expected))
+                    expected += 1
+                if not buf:
+                    del self._ordered_queue[channel]
+            self._ordered_read_index[channel] = expected
+        elif index > expected:
+            buf = self._ordered_queue.setdefault(channel, {})
+            buf[index] = data
 
     def _process_payload(self, data: bytes) -> None:
         if not data:
