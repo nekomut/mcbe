@@ -1,19 +1,30 @@
-"""ブロック配置ボット.
+"""DEM地形配置ボット（並列対応）.
 
-BDS に直接接続し、/setblock コマンドでブロックを配置する。
-mc/samples/golang/blockplacer2 の Python 移植版。
+BDS に直接接続し、基盤地図情報 DEM5A から生成した地形を配置する。
+複数ボットで並列配置し、途中終了しても次回レジュームできる。
 
-初回のみ BDS コンソールで /op b を実行すること。
+初回のみ BDS コンソールで各ボットに /op を実行すること。
+  例: ボット2体なら /op a と /op b
+
+地形データ:
+  - 原点: (36.104665°N, 140.087099°E) → MC座標 (0, 0, 0)
+  - 解像度: 1m/ブロック (5m DEM を cubic spline で補間)
+  - 基準標高: 16m (= Y=0)
+  - MC座標: X+=東, Z+=南, Y+=上
 
 Usage:
-    python examples/place_block.py --address 192.168.1.28:19132
+    python examples/place_block.py --address 192.168.1.28:19132 --bots 4
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import json
 import logging
+import os
+import time
 
 from pymc.dial import Dialer
 from pymc.raknet import RakNetNetwork
@@ -23,90 +34,204 @@ from pymc.proto.packet.network_stack_latency import NetworkStackLatency
 
 logger = logging.getLogger(__name__)
 
+TERRAIN_JSON = os.path.join(os.path.dirname(__file__), "terrain.json")
+HEIGHTMAP_CSV = os.path.join(os.path.dirname(__file__), "heightmap.csv")
+BUILDINGMAP_CSV = os.path.join(os.path.dirname(__file__), "buildingmap.csv")
+PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "heightmap.progress")
+BUILDING_PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "building.progress")
+BUILDING_BLOCK_TYPE = "quartz_block"
+BUILDING_HEIGHT = 5
+CLEAR_HEIGHT = 150
 
-async def main(address: str) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+# サーフェスタイプ → ブロック種別
+SURFACE_BLOCKS = {
+    0: "grass_block",  # 草地（デフォルト）
+    1: "stone",        # 道路
+    2: "water",        # 水域
+}
+
+# ボット名: a~z
+BOT_NAMES = [chr(ord("a") + i) for i in range(26)]
+# 各ボットに固定 UUID を割り当て
+BOT_UUIDS = [f"b1e3a2f4-5c6d-7e8f-9a0b-1c2d3e4f5{i:03x}" for i in range(26)]
+BOT_XUIDS = [f"{1000000000000000 + i}" for i in range(26)]
+
+
+def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[list[int]] | None, list[list[int]] | None, int, int]:
+    """地形データを読み込む. JSON があれば優先、なければ CSV にフォールバック.
+
+    Returns: (heightmap, buildingmap, surfacemap, x_offset, z_offset)
+    x_offset/z_offset は heightmap[0][0] の MC 座標。
+    surfacemap: 0=草地, 1=道路, 2=水域 (None なら全て stone)。
+    """
+    if os.path.exists(json_path):
+        with open(json_path) as f:
+            data = json.load(f)
+        heightmap = data["heightmap"]
+        buildingmap = data.get("buildingmap")
+        surfacemap = data.get("surfacemap")
+        # mc_start: グリッド開始MC座標
+        mc_start = data.get("mc_start", {})
+        x_off = mc_start.get("x", 0)
+        z_off = mc_start.get("z", 0)
+        return heightmap, buildingmap, surfacemap, x_off, z_off
+
+    # CSV フォールバック
+    heightmap = []
+    with open(csv_path) as f:
+        for row in csv.reader(f):
+            heightmap.append([int(v) for v in row])
+    buildingmap = None
+    if os.path.exists(BUILDINGMAP_CSV):
+        buildingmap = []
+        with open(BUILDINGMAP_CSV) as f:
+            for row in csv.reader(f):
+                buildingmap.append([int(v) for v in row])
+    return heightmap, buildingmap, None, 0, 0
+
+
+def load_progress(path: str) -> set[int]:
+    """完了済み行番号を読み込む."""
+    if not os.path.exists(path):
+        return set()
+    done = set()
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                done.add(int(line))
+    return done
+
+
+def save_progress_line(path: str, z: int) -> None:
+    """完了した行番号を追記する."""
+    with open(path, "a") as f:
+        f.write(f"{z}\n")
+
+
+async def connect_bot(bot_id: int, address: str) -> tuple:
+    """1体のボットを接続してコネクションを返す."""
+    name = BOT_NAMES[bot_id]
+    log = logging.getLogger(f"bot.{name}")
 
     network = RakNetNetwork()
-
-    try:
-        pong = await network.ping(address)
-        logger.info("サーバー発見: %s", pong.decode()[:80])
-    except Exception as e:
-        logger.error("サーバー応答なし: %s", e)
-        return
-
-    logger.info("BDS %s に直接接続します...", address)
-
     dialer = Dialer(
         identity_data=IdentityData(
-            display_name="b",
-            identity="b1e3a2f4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
-            xuid="1000000000000000",
+            display_name=name,
+            identity=BOT_UUIDS[bot_id],
+            xuid=BOT_XUIDS[bot_id],
         ),
         network=network,
     )
 
     conn = await dialer.dial(address)
-    logger.info("スポーン完了!")
-    logger.info("BDS コンソールで /op b を実行してから、Enterキーを押してください")
+    log.info("スポーン完了")
+    return conn
 
-    # パケット読み取りタスク（接続維持 + コマンド結果表示）
+
+def start_read_task(conn) -> asyncio.Task:
+    """パケット読み取りタスクを開始する."""
     async def read_packets() -> None:
         try:
             while True:
                 pk = await conn.read_packet()
-                if isinstance(pk, NetworkStackLatency):
-                    if pk.needs_response:
-                        await conn.write_packet(
-                            NetworkStackLatency(
-                                timestamp=pk.timestamp,
-                                needs_response=False,
-                            )
-                        )
-                        await conn.flush()
-                else:
-                    name = type(pk).__name__
-                    if name == "UnknownPacket":
-                        continue
-                    logger.debug("受信: %s", name)
-        except Exception as e:
-            logger.debug("パケット読み取り終了: %s", e)
+                if isinstance(pk, NetworkStackLatency) and pk.needs_response:
+                    await conn.write_packet(
+                        NetworkStackLatency(timestamp=pk.timestamp, needs_response=False)
+                    )
+                    await conn.flush()
+        except Exception:
+            pass
 
-    read_task = asyncio.create_task(read_packets())
+    return asyncio.create_task(read_packets())
+
+
+async def bot_worker(
+    bot_id: int,
+    conn,
+    read_task: asyncio.Task,
+    heightmap: list[list[int]],
+    buildingmap: list[list[int]] | None,
+    surfacemap: list[list[int]] | None,
+    rows: list[int],
+    phase: str,
+    progress_file: str,
+    stats: dict,
+    x_offset: int = 0,
+    z_offset: int = 0,
+) -> None:
+    """1体のボットが担当行のブロックを配置する."""
+    name = BOT_NAMES[bot_id]
+    log = logging.getLogger(f"bot.{name}")
+
+    cmd_count = 0
+    size_x = len(heightmap[0])
+
+    def block_at(z: int, x: int) -> str:
+        """surfacemap に基づいてブロック種別を返す."""
+        if surfacemap is not None:
+            return SURFACE_BLOCKS.get(surfacemap[z][x], "grass")
+        return "stone"
+
+    async def run_cmd(cmd: str) -> None:
+        nonlocal cmd_count
+        cmd_count += 1
+        await conn.write_packet(
+            CommandRequest(
+                command_line=cmd,
+                command_origin=CommandOrigin(origin=ORIGIN_PLAYER),
+                internal=False,
+                version="latest",
+            )
+        )
+        await conn.flush()
+        await asyncio.sleep(0.01)
 
     try:
-        await asyncio.to_thread(input, "")
+        for i, z in enumerate(rows):
+            mc_z = z + z_offset
+            if phase == "terrain":
+                # 地形配置 + 上空クリアを1パスで実行
+                await run_cmd(f"/tp {name} {x_offset} {CLEAR_HEIGHT} {mc_z}")
+                for x in range(size_x):
+                    h = heightmap[z][x]
+                    mc_x = x + x_offset
+                    if h >= 0:
+                        block = block_at(z, x)
+                        await run_cmd(f"/tp {name} {mc_x} {h + 5} {mc_z}")
+                        if block == "water" and h >= 5:
+                            # 水域: 上2ブロック=air, 3~5=water, 6以下=草地
+                            await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h - 5} {mc_z} grass_block")
+                            await run_cmd(f"/fill {mc_x} {h - 4} {mc_z} {mc_x} {h - 2} {mc_z} water")
+                            await run_cmd(f"/fill {mc_x} {h - 1} {mc_z} {mc_x} {h} {mc_z} air")
+                        elif block == "stone" and h >= 3:
+                            # 道路: 上3ブロック=stone, 4以下=草地
+                            await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h - 3} {mc_z} grass_block")
+                            await run_cmd(f"/fill {mc_x} {h - 2} {mc_z} {mc_x} {h} {mc_z} stone")
+                        else:
+                            await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h} {mc_z} {block}")
+                        if h + 1 <= CLEAR_HEIGHT:
+                            await run_cmd(f"/fill {mc_x} {h + 1} {mc_z} {mc_x} {CLEAR_HEIGHT} {mc_z} air")
+            elif phase == "building" and buildingmap is not None:
+                # 建物配置
+                await run_cmd(f"/tp {name} {x_offset} {heightmap[z][0] + BUILDING_HEIGHT + 5} {mc_z}")
+                for x in range(size_x):
+                    if buildingmap[z][x] == 1:
+                        h = heightmap[z][x]
+                        mc_x = x + x_offset
+                        if h >= 0:
+                            y_bottom = h + 1
+                            y_top = h + BUILDING_HEIGHT
+                            await run_cmd(f"/tp {name} {mc_x} {y_top + 5} {mc_z}")
+                            await run_cmd(
+                                f"/fill {mc_x} {y_bottom} {mc_z} {mc_x} {y_top} {mc_z} {BUILDING_BLOCK_TYPE}"
+                            )
+            save_progress_line(progress_file, z)
+            stats["done_rows"] += 1
+            log.info("  [%s] 行完了: z=%d (%d/%d) %d cmd", phase, z, i + 1, len(rows), cmd_count)
 
-        async def run_cmd(cmd: str) -> None:
-            logger.info("[実行] %s", cmd)
-            await conn.write_packet(
-                CommandRequest(
-                    command_line=cmd,
-                    command_origin=CommandOrigin(origin=ORIGIN_PLAYER),
-                    internal=False,
-                    version="latest",
-                )
-            )
-            await conn.flush()
-            await asyncio.sleep(0.2)
-
-        logger.info("=== stone 配置 (Y=70〜80) ===")
-        for y in range(70, 81):
-            await run_cmd(f"/setblock 0 {y} 0 stone")
-
-        logger.info("=== air 配置 (Y=80〜70) ===")
-        for y in range(80, 69, -1):
-            await run_cmd(f"/setblock 0 {y} 0 air")
-
-        logger.info("=== 完了! ===")
-
-        # コマンド応答を待つ
-        await asyncio.sleep(5)
-
+        stats["cmd_total"] += cmd_count
+        log.info("[%s] 担当完了! %d 行, %d コマンド", phase, len(rows), cmd_count)
     finally:
         read_task.cancel()
         try:
@@ -116,8 +241,134 @@ async def main(address: str) -> None:
         await conn.close()
 
 
+async def main(address: str, num_bots: int, *, reset: bool = False) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
+    if num_bots < 1 or num_bots > 26:
+        logger.error("ボット数は 1~26 で指定してください")
+        return
+
+    ping_network = RakNetNetwork()
+    try:
+        pong = await ping_network.ping(address)
+        logger.info("サーバー発見: %s", pong.decode()[:80])
+    except Exception as e:
+        logger.error("サーバー応答なし: %s", e)
+        return
+
+    heightmap, buildingmap, surfacemap, x_offset, z_offset = load_terrain(TERRAIN_JSON, HEIGHTMAP_CSV)
+    size_z = len(heightmap)
+    size_x = len(heightmap[0])
+    source = "JSON" if os.path.exists(TERRAIN_JSON) else "CSV"
+    logger.info("高さマップ: %dx%d (%s)", size_x, size_z, source)
+    if x_offset or z_offset:
+        logger.info("オフセット: X=%d, Z=%d", x_offset, z_offset)
+
+    if surfacemap:
+        logger.info("サーフェスマップ: あり (草地/道路/水域)")
+    else:
+        logger.info("サーフェスマップ: なし (全て stone)")
+
+    if buildingmap:
+        logger.info("建物マップ: %dx%d", len(buildingmap[0]), len(buildingmap))
+
+    # フェーズ判定: 地形（+上空クリア）→ 建物 の順に実行
+    if reset:
+        for pf in [PROGRESS_FILE, BUILDING_PROGRESS_FILE]:
+            if os.path.exists(pf):
+                os.remove(pf)
+        logger.info("進捗リセット")
+
+    phases = []
+
+    terrain_done = load_progress(PROGRESS_FILE) if not reset else set()
+    terrain_remaining = [z for z in range(size_z) if z not in terrain_done]
+    if terrain_remaining:
+        phases.append(("terrain", terrain_remaining, PROGRESS_FILE))
+    else:
+        logger.info("地形: 全行配置済み")
+
+    if buildingmap:
+        building_done = load_progress(BUILDING_PROGRESS_FILE) if not reset else set()
+        building_remaining = [z for z in range(size_z) if z not in building_done]
+        if building_remaining:
+            phases.append(("building", building_remaining, BUILDING_PROGRESS_FILE))
+        else:
+            logger.info("建物: 全行配置済み")
+
+    if not phases:
+        logger.info("全フェーズ完了済みです。リセットするには .progress ファイルを削除してください。")
+        return
+
+    for phase_name, remaining, progress_file in phases:
+        logger.info("=== %s フェーズ: 残り %d/%d 行 ===", phase_name, len(remaining), size_z)
+
+        actual_bots = min(num_bots, len(remaining))
+        chunks: list[list[int]] = [[] for _ in range(actual_bots)]
+        for i, z in enumerate(remaining):
+            chunks[i % actual_bots].append(z)
+
+        bot_names = [BOT_NAMES[i] for i in range(actual_bots)]
+        logger.info("ボット %d 体: %s", actual_bots, ", ".join(bot_names))
+
+        # ボットを1体ずつ順次接続
+        connections = []
+        read_tasks = []
+        for i in range(actual_bots):
+            logger.info("接続中: %s (%d/%d)...", BOT_NAMES[i], i + 1, actual_bots)
+            conn = await connect_bot(i, address)
+            read_task = start_read_task(conn)
+            connections.append(conn)
+            read_tasks.append(read_task)
+            if i < actual_bots - 1:
+                await asyncio.sleep(1)
+
+        logger.info("全ボット接続完了!")
+        if phase_name == phases[0][0]:  # 最初のフェーズのみ op を待つ
+            logger.info("BDS コンソールで以下を実行してから Enter を押してください:")
+            for n in bot_names:
+                logger.info("  /op %s", n)
+            await asyncio.to_thread(input, "")
+
+        stats = {"done_rows": 0, "cmd_total": 0}
+        t_start = time.monotonic()
+
+        async def progress_monitor(total: int) -> None:
+            while stats["done_rows"] < total:
+                await asyncio.sleep(2)
+                elapsed = time.monotonic() - t_start
+                done = stats["done_rows"]
+                if done > 0:
+                    eta = elapsed / done * (total - done)
+                    logger.info("=== [%s] 全体進捗: %d/%d 行 (%.1f%%) 残り %d秒 ===",
+                                phase_name, done, total, done / total * 100, int(eta))
+
+        monitor = asyncio.create_task(progress_monitor(len(remaining)))
+
+        await asyncio.gather(
+            *(bot_worker(i, connections[i], read_tasks[i], heightmap, buildingmap,
+                         surfacemap, chunks[i], phase_name, progress_file, stats,
+                         x_offset, z_offset)
+              for i in range(actual_bots))
+        )
+
+        monitor.cancel()
+        try:
+            await monitor
+        except asyncio.CancelledError:
+            pass
+
+        elapsed_total = time.monotonic() - t_start
+        logger.info("=== [%s] 完了! %d 行, %.1f秒 ===", phase_name, len(remaining), elapsed_total)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Place blocks via commands")
-    parser.add_argument("--address", default="192.168.1.28:19132")
+    parser = argparse.ArgumentParser(description="DEM地形をMinecraftに配置する")
+    parser.add_argument("--address", default="192.168.1.24:19132")
+    parser.add_argument("--bots", type=int, default=5, help="並列ボット数 (default: 5, max: 26)")
+    parser.add_argument("--reset", action="store_true", help="進捗をリセットして最初からやり直す")
     args = parser.parse_args()
-    asyncio.run(main(args.address))
+    asyncio.run(main(args.address, args.bots, reset=args.reset))
