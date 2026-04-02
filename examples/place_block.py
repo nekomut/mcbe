@@ -60,13 +60,14 @@ BOT_UUIDS = [f"b1e3a2f4-5c6d-7e8f-9a0b-1c2d3e4f5{i:03x}" for i in range(26)]
 BOT_XUIDS = [f"{1000000000000000 + i}" for i in range(26)]
 
 
-def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[list[int]] | None, list[list[int]] | None, list[list[int]] | None, int, int]:
+def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[list[int]] | None, list[list[int]] | None, list[list[int]] | None, list[list[int]] | None, int, int]:
     """地形データを読み込む. JSON があれば優先、なければ CSV にフォールバック.
 
-    Returns: (heightmap, buildingmap, surfacemap, bridgemap, x_offset, z_offset)
+    Returns: (heightmap, buildingmap, surfacemap, bridgemap, centerlinemap, x_offset, z_offset)
     x_offset/z_offset は heightmap[0][0] の MC 座標。
     surfacemap: 0=草地, 1=道路, 2=水域 (None なら全て stone)。
     bridgemap: 橋がある座標 = 1 (None なら橋なし)。
+    centerlinemap: 道路中心線 = 1 (None なら中心線なし)。
     """
     if os.path.exists(json_path):
         with open(json_path) as f:
@@ -75,10 +76,11 @@ def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[l
         buildingmap = data.get("buildingmap")
         surfacemap = data.get("surfacemap")
         bridgemap = data.get("bridgemap")
+        centerlinemap = data.get("centerlinemap")
         mc_start = data.get("mc_start", {})
         x_off = mc_start.get("x", 0)
         z_off = mc_start.get("z", 0)
-        return heightmap, buildingmap, surfacemap, bridgemap, x_off, z_off
+        return heightmap, buildingmap, surfacemap, bridgemap, centerlinemap, x_off, z_off
 
     # CSV フォールバック
     heightmap = []
@@ -91,7 +93,7 @@ def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[l
         with open(BUILDINGMAP_CSV) as f:
             for row in csv.reader(f):
                 buildingmap.append([int(v) for v in row])
-    return heightmap, buildingmap, None, None, 0, 0
+    return heightmap, buildingmap, None, None, None, 0, 0
 
 
 def load_progress(path: str) -> set[int]:
@@ -158,6 +160,7 @@ async def bot_worker(
     buildingmap: list[list[int]] | None,
     surfacemap: list[list[int]] | None,
     bridgemap: list[list[int]] | None,
+    centerlinemap: list[list[int]] | None,
     rows: list[int],
     phase: str,
     progress_file: str,
@@ -210,12 +213,12 @@ async def bot_worker(
                         top = h + slab        # 最上位の Y 座標
                         block = block_at(z, x)
                         await run_cmd(f"/tp {name} {mc_x} {top + 5} {mc_z}")
-                        if block == "water" and h >= 7:
-                            # 水域: 上2=air, 3~5=water, 6~7=grass_block, 8以下=stone
-                            await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h - 7} {mc_z} stone")
-                            await run_cmd(f"/fill {mc_x} {h - 6} {mc_z} {mc_x} {h - 5} {mc_z} grass_block")
-                            await run_cmd(f"/fill {mc_x} {h - 4} {mc_z} {mc_x} {h - 2} {mc_z} water")
-                            await run_cmd(f"/fill {mc_x} {h - 1} {mc_z} {mc_x} {h} {mc_z} air")
+                        if block == "water" and h >= 9:
+                            # 水域: 上4=air, 5~7=water, 8~9=grass_block, 10以下=stone
+                            await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h - 9} {mc_z} stone")
+                            await run_cmd(f"/fill {mc_x} {h - 8} {mc_z} {mc_x} {h - 7} {mc_z} grass_block")
+                            await run_cmd(f"/fill {mc_x} {h - 6} {mc_z} {mc_x} {h - 4} {mc_z} water")
+                            await run_cmd(f"/fill {mc_x} {h - 3} {mc_z} {mc_x} {h} {mc_z} air")
                         elif block == "stone" and h >= 5:
                             # 道路: 上3=stone, 4~5=grass_block, 6以下=stone
                             await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h - 5} {mc_z} stone")
@@ -236,6 +239,11 @@ async def bot_worker(
                             await run_cmd(
                                 f"/setblock {mc_x} {h + 1} {mc_z} normal_stone_slab"
                             )
+                        # 道路中心線にレッドストーンブロック配置（最上面を置換）
+                        if (centerlinemap is not None
+                                and centerlinemap[z][x] == 1):
+                            await run_cmd(
+                                f"/setblock {mc_x} {top} {mc_z} redstone_block")
                         # 上空クリア
                         clear_from = top + 1
                         if clear_from <= CLEAR_HEIGHT:
@@ -310,7 +318,7 @@ async def main(address: str, num_bots: int, *, reset: bool = False) -> None:
         logger.error("サーバー応答なし: %s", e)
         return
 
-    heightmap, buildingmap, surfacemap, bridgemap, x_offset, z_offset = load_terrain(TERRAIN_JSON, HEIGHTMAP_CSV)
+    heightmap, buildingmap, surfacemap, bridgemap, centerlinemap, x_offset, z_offset = load_terrain(TERRAIN_JSON, HEIGHTMAP_CSV)
     size_z = len(heightmap)
     size_x = len(heightmap[0])
     source = "JSON" if os.path.exists(TERRAIN_JSON) else "CSV"
@@ -328,6 +336,9 @@ async def main(address: str, num_bots: int, *, reset: bool = False) -> None:
 
     if bridgemap:
         logger.info("橋マップ: %dx%d", len(bridgemap[0]), len(bridgemap))
+
+    if centerlinemap:
+        logger.info("中心線マップ: あり (レッドストーン配置)")
 
     BRIDGE_PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "bridge.progress")
 
@@ -415,7 +426,8 @@ async def main(address: str, num_bots: int, *, reset: bool = False) -> None:
 
         await asyncio.gather(
             *(bot_worker(i, connections[i], read_tasks[i], heightmap, buildingmap,
-                         surfacemap, bridgemap, chunks[i], phase_name, progress_file,
+                         surfacemap, bridgemap, centerlinemap,
+                         chunks[i], phase_name, progress_file,
                          stats, x_offset, z_offset)
               for i in range(actual_bots))
         )
