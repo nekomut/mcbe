@@ -40,8 +40,10 @@ BUILDINGMAP_CSV = os.path.join(os.path.dirname(__file__), "buildingmap.csv")
 PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "heightmap.progress")
 BUILDING_PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "building.progress")
 BUILDING_BLOCK_TYPE = "quartz_block"
+BRIDGE_BLOCK_TYPE = "stone"
 SCALE = 0.75  # メートル/ブロック — plot_dem3d.py と一致させること
 BUILDING_HEIGHT = int(round(5.0 / SCALE))   # 物理5m → 7ブロック
+BRIDGE_THICKNESS = 2                        # 橋の厚み（ブロック数）
 CLEAR_HEIGHT = int(round(150.0 / SCALE))    # 物理150m → 200ブロック
 
 # サーフェスタイプ → ブロック種別
@@ -58,12 +60,13 @@ BOT_UUIDS = [f"b1e3a2f4-5c6d-7e8f-9a0b-1c2d3e4f5{i:03x}" for i in range(26)]
 BOT_XUIDS = [f"{1000000000000000 + i}" for i in range(26)]
 
 
-def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[list[int]] | None, list[list[int]] | None, int, int]:
+def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[list[int]] | None, list[list[int]] | None, list[list[int]] | None, int, int]:
     """地形データを読み込む. JSON があれば優先、なければ CSV にフォールバック.
 
-    Returns: (heightmap, buildingmap, surfacemap, x_offset, z_offset)
+    Returns: (heightmap, buildingmap, surfacemap, bridgemap, x_offset, z_offset)
     x_offset/z_offset は heightmap[0][0] の MC 座標。
     surfacemap: 0=草地, 1=道路, 2=水域 (None なら全て stone)。
+    bridgemap: 橋がある座標 = 1 (None なら橋なし)。
     """
     if os.path.exists(json_path):
         with open(json_path) as f:
@@ -71,11 +74,11 @@ def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[l
         heightmap = data["heightmap"]
         buildingmap = data.get("buildingmap")
         surfacemap = data.get("surfacemap")
-        # mc_start: グリッド開始MC座標
+        bridgemap = data.get("bridgemap")
         mc_start = data.get("mc_start", {})
         x_off = mc_start.get("x", 0)
         z_off = mc_start.get("z", 0)
-        return heightmap, buildingmap, surfacemap, x_off, z_off
+        return heightmap, buildingmap, surfacemap, bridgemap, x_off, z_off
 
     # CSV フォールバック
     heightmap = []
@@ -88,7 +91,7 @@ def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[l
         with open(BUILDINGMAP_CSV) as f:
             for row in csv.reader(f):
                 buildingmap.append([int(v) for v in row])
-    return heightmap, buildingmap, None, 0, 0
+    return heightmap, buildingmap, None, None, 0, 0
 
 
 def load_progress(path: str) -> set[int]:
@@ -154,6 +157,7 @@ async def bot_worker(
     heightmap: list[list[int]],
     buildingmap: list[list[int]] | None,
     surfacemap: list[list[int]] | None,
+    bridgemap: list[list[int]] | None,
     rows: list[int],
     phase: str,
     progress_file: str,
@@ -253,6 +257,26 @@ async def bot_worker(
                             await run_cmd(
                                 f"/fill {mc_x} {y_bottom} {mc_z} {mc_x} {y_top} {mc_z} {BUILDING_BLOCK_TYPE}"
                             )
+            elif phase == "bridge" and bridgemap is not None:
+                # 橋配置: bridgemap の高さ（半ブロック単位）で stone を敷く
+                # heightmap は水面レベル、bridgemap が道路レベルの高さを持つ
+                h0 = (heightmap[z][0] // 2) + (heightmap[z][0] % 2)
+                await run_cmd(f"/tp {name} {x_offset} {h0 + 10} {mc_z}")
+                for x in range(size_x):
+                    bridge_h_half = bridgemap[z][x]
+                    if bridge_h_half > 0:
+                        mc_x = x + x_offset
+                        h = bridge_h_half // 2
+                        slab = bridge_h_half % 2
+                        top = h + slab
+                        await run_cmd(f"/tp {name} {mc_x} {top + 5} {mc_z}")
+                        # 橋面: 最大2ブロックの stone
+                        if h >= 1:
+                            await run_cmd(f"/fill {mc_x} {h - 1} {mc_z} {mc_x} {h} {mc_z} stone")
+                        else:
+                            await run_cmd(f"/setblock {mc_x} 0 {mc_z} stone")
+                        if slab:
+                            await run_cmd(f"/setblock {mc_x} {h + 1} {mc_z} normal_stone_slab")
             save_progress_line(progress_file, z)
             stats["done_rows"] += 1
             log.info("  [%s] 行完了: z=%d (%d/%d) %d cmd", phase, z, i + 1, len(rows), cmd_count)
@@ -286,7 +310,7 @@ async def main(address: str, num_bots: int, *, reset: bool = False) -> None:
         logger.error("サーバー応答なし: %s", e)
         return
 
-    heightmap, buildingmap, surfacemap, x_offset, z_offset = load_terrain(TERRAIN_JSON, HEIGHTMAP_CSV)
+    heightmap, buildingmap, surfacemap, bridgemap, x_offset, z_offset = load_terrain(TERRAIN_JSON, HEIGHTMAP_CSV)
     size_z = len(heightmap)
     size_x = len(heightmap[0])
     source = "JSON" if os.path.exists(TERRAIN_JSON) else "CSV"
@@ -302,9 +326,14 @@ async def main(address: str, num_bots: int, *, reset: bool = False) -> None:
     if buildingmap:
         logger.info("建物マップ: %dx%d", len(buildingmap[0]), len(buildingmap))
 
-    # フェーズ判定: 地形（+上空クリア）→ 建物 の順に実行
+    if bridgemap:
+        logger.info("橋マップ: %dx%d", len(bridgemap[0]), len(bridgemap))
+
+    BRIDGE_PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "bridge.progress")
+
+    # フェーズ判定: 地形 → 建物 → 橋 の順に実行
     if reset:
-        for pf in [PROGRESS_FILE, BUILDING_PROGRESS_FILE]:
+        for pf in [PROGRESS_FILE, BUILDING_PROGRESS_FILE, BRIDGE_PROGRESS_FILE]:
             if os.path.exists(pf):
                 os.remove(pf)
         logger.info("進捗リセット")
@@ -325,6 +354,14 @@ async def main(address: str, num_bots: int, *, reset: bool = False) -> None:
             phases.append(("building", building_remaining, BUILDING_PROGRESS_FILE))
         else:
             logger.info("建物: 全行配置済み")
+
+    if bridgemap:
+        bridge_done = load_progress(BRIDGE_PROGRESS_FILE) if not reset else set()
+        bridge_remaining = [z for z in range(size_z) if z not in bridge_done]
+        if bridge_remaining:
+            phases.append(("bridge", bridge_remaining, BRIDGE_PROGRESS_FILE))
+        else:
+            logger.info("橋: 全行配置済み")
 
     if not phases:
         logger.info("全フェーズ完了済みです。リセットするには .progress ファイルを削除してください。")
@@ -358,7 +395,8 @@ async def main(address: str, num_bots: int, *, reset: bool = False) -> None:
             logger.info("BDS コンソールで以下を実行してから Enter を押してください:")
             for n in bot_names:
                 logger.info("  /op %s", n)
-            await asyncio.to_thread(input, "")
+            # await asyncio.to_thread(input, "")
+            await asyncio.sleep(1)
 
         stats = {"done_rows": 0, "cmd_total": 0}
         t_start = time.monotonic()
@@ -377,8 +415,8 @@ async def main(address: str, num_bots: int, *, reset: bool = False) -> None:
 
         await asyncio.gather(
             *(bot_worker(i, connections[i], read_tasks[i], heightmap, buildingmap,
-                         surfacemap, chunks[i], phase_name, progress_file, stats,
-                         x_offset, z_offset)
+                         surfacemap, bridgemap, chunks[i], phase_name, progress_file,
+                         stats, x_offset, z_offset)
               for i in range(actual_bots))
         )
 
