@@ -401,7 +401,7 @@ def rasterize_polygons(polys: list[list], shape: tuple[int, int],
 
 def gen_maps(road_lines: list, water_polys: list, building_polys: list,
              shape: tuple[int, int], mc_x_start: int, mc_z_start: int,
-             scale: float, *, debug: bool = False,
+             scale: float, *, debug: bool = False, no_fill: bool = False,
              ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """道路・水域・建物からサーフェスマップ・建物マップ・橋マップを生成.
 
@@ -463,33 +463,39 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
         elif 2700 <= ft_code < 2800:
             rasterize_to_mask(mc_coords, all_road_lines, val=True)
 
-    # 22xx で区切られた領域をラベリングし、270x を含む領域 = 道路面
+    # 道路面の生成
     from scipy.ndimage import binary_dilation, convolve
-    regions, n_regions = ndimage_label(~edge_22xx)
-    road_region_ids = set(np.unique(regions[marker_270x]))
-    road_region_ids.discard(0)
-    road_side = np.isin(regions, list(road_region_ids)) if road_region_ids else np.zeros(shape, dtype=bool)
-    # 22xx からの距離で制限
-    dist_to_22 = distance_transform_edt(~edge_22xx)
-    road_filled = road_side & (dist_to_22 <= max_road_half_width)
-    road_filled |= edge_22xx & (dist_to_22 == 0)  # 22xx 自体も含める
-    road_filled |= marker_270x  # 270x 自体も含める
-    # 細い道（271x-273x）は線のみ道路扱い
-    road_filled |= all_road_lines
+    if no_fill:
+        # 領域ラベリングをスキップ: ラスタライズした線のみ
+        road_filled = edge_22xx | marker_270x | all_road_lines
+        print(f"  道路縁線(線のみ): 22xx={int(edge_22xx.sum())}, 270x={int(marker_270x.sum())}")
+    else:
+        # 22xx で区切られた領域をラベリングし、270x を含む領域 = 道路面
+        regions, n_regions = ndimage_label(~edge_22xx)
+        road_region_ids = set(np.unique(regions[marker_270x]))
+        road_region_ids.discard(0)
+        road_side = np.isin(regions, list(road_region_ids)) if road_region_ids else np.zeros(shape, dtype=bool)
+        # 22xx からの距離で制限
+        dist_to_22 = distance_transform_edt(~edge_22xx)
+        road_filled = road_side & (dist_to_22 <= max_road_half_width)
+        road_filled |= edge_22xx & (dist_to_22 == 0)  # 22xx 自体も含める
+        road_filled |= marker_270x  # 270x 自体も含める
+        # 細い道（271x-273x）は線のみ道路扱い
+        road_filled |= all_road_lines
 
-    # 穴埋め（通常道路近傍のみ）
-    dist_to_270 = distance_transform_edt(~marker_270x)
-    normal_road_area = dist_to_270 <= max_road_half_width
-    kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=np.int8)
-    edge_nbr = convolve(edge_22xx.astype(np.int8), kernel, mode='constant')
-    one_block_gap = ~edge_22xx & (edge_nbr >= 2)
-    road_filled |= one_block_gap & normal_road_area
-    for _ in range(3):
-        rs_nbr = convolve(road_filled.astype(np.int8), kernel, mode='constant')
-        road_filled |= ~road_filled & (rs_nbr >= 3) & normal_road_area
+        # 穴埋め（通常道路近傍のみ）
+        dist_to_270 = distance_transform_edt(~marker_270x)
+        normal_road_area = dist_to_270 <= max_road_half_width
+        kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=np.int8)
+        edge_nbr = convolve(edge_22xx.astype(np.int8), kernel, mode='constant')
+        one_block_gap = ~edge_22xx & (edge_nbr >= 2)
+        road_filled |= one_block_gap & normal_road_area
+        for _ in range(3):
+            rs_nbr = convolve(road_filled.astype(np.int8), kernel, mode='constant')
+            road_filled |= ~road_filled & (rs_nbr >= 3) & normal_road_area
 
-    print(f"  道路縁線: 22xx={int(edge_22xx.sum())}, 270x={int(marker_270x.sum())}, "
-          f"領域: {len(road_region_ids)}/{n_regions}")
+        print(f"  道路縁線: 22xx={int(edge_22xx.sum())}, 270x={int(marker_270x.sum())}, "
+              f"領域: {len(road_region_ids)}/{n_regions}")
 
     # 橋 = 道路が水域を横断する箇所（road_filled と水域の重なり）
     bridge_mask = road_filled & water_mask
@@ -742,6 +748,8 @@ def main():
                         help="MC中心の Z座標 (default: 0)")
     parser.add_argument("-o", "--output", default=None,
                         help="出力パス (default: examples/terrain.json)")
+    parser.add_argument("--no-fill", action="store_true",
+                        help="領域ラベリングをスキップし道路線のみ出力")
     parser.add_argument("--debug", action="store_true",
                         help="デバッグ用: 道路中心線マップを出力")
     args = parser.parse_args()
@@ -782,7 +790,8 @@ def main():
     # サーフェスマップ・建物マップ・橋マップ生成
     surfacemap, buildingmap, bridgemap, centerlinemap = gen_maps(
         road_lines, water_polys, building_polys,
-        interp.shape, mc_x_start, mc_z_start, scale, debug=args.debug)
+        interp.shape, mc_x_start, mc_z_start, scale,
+        debug=args.debug, no_fill=args.no_fill)
 
     # 道路平坦化
     flatten_roads(interp, surfacemap, dem_data, dem_x, dem_z,
