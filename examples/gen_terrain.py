@@ -515,11 +515,16 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
     if road_filled.any():
         bridge_seed = road_filled & water_mask
         if bridge_seed.any():
+            # 岸の道路幅で橋を膨張
+            # 水域を道路の延長とみなし、陸側の真の道路境界からの距離 = 道路半幅
+            road_or_water = road_filled | water_mask
+            dist_to_true_edge = distance_transform_edt(road_or_water)
             shore_road = road_filled & ~water_mask
             if shore_road.any():
                 shore_dist, shore_idx = distance_transform_edt(
                     ~shore_road, return_distances=True, return_indices=True)
-                shore_hw = dist_to_22[shore_idx[0], shore_idx[1]]
+                # 最寄り岸道路セルでの道路半幅（水域を無視した真のエッジからの距離）
+                shore_hw = dist_to_true_edge[shore_idx[0], shore_idx[1]]
                 shore_hw = np.minimum(shore_hw, max_road_half_width)
                 bridge_dist = distance_transform_edt(~bridge_seed)
                 bridge_mask = water_mask & (bridge_dist <= shore_hw)
@@ -538,10 +543,43 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
 
     bridgemap = bridge_mask.astype(np.int8) if bridge_count > 0 else None
 
-    # 中心線マップ (debug 用)
+    # 中心線マップ (debug 用) — 道路・橋ロジックとは独立した領域ラベリング
     centerlinemap = None
     if debug:
-        filled = road_filled.copy()
+        # 22xx/24xx（道路縁線）
+        dbg_edge_22xx = np.zeros(shape, dtype=bool)
+        for mc_coords, ft_code in road_lines:
+            if 2200 <= ft_code < 2300 or 2400 <= ft_code < 2500:
+                rasterize_to_mask(mc_coords, dbg_edge_22xx, val=True)
+
+        # 270x のみ（通常道路）— 細い道 271x-273x は充填対象外
+        dbg_marker_270x = np.zeros(shape, dtype=bool)
+        for mc_coords, ft_code in road_lines:
+            if 2700 <= ft_code < 2710:
+                rasterize_to_mask(mc_coords, dbg_marker_270x, val=True)
+
+        # 22xx で区切られた領域をラベリング
+        dbg_regions, dbg_n_regions = ndimage_label(~dbg_edge_22xx)
+        # 270x が含まれる領域 = 道路側
+        road_region_ids = set(np.unique(dbg_regions[dbg_marker_270x]))
+        road_region_ids.discard(0)
+        dbg_road_side = np.isin(dbg_regions, list(road_region_ids)) if road_region_ids else np.zeros(shape, dtype=bool)
+        # 22xx からの距離で制限
+        dbg_dist_to_22 = distance_transform_edt(~dbg_edge_22xx)
+        filled = dbg_road_side & (dbg_dist_to_22 <= max_road_half_width)
+        filled |= dbg_edge_22xx & (dbg_dist_to_22 == 0)  # 22xx 自体も含める
+        filled |= dbg_marker_270x  # 270x 自体も含める
+
+        # 穴埋め（通常道路のみ、細い道 271x-273x は除外）
+        dbg_kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=np.int8)
+        dbg_edge_nbr = convolve(dbg_edge_22xx.astype(np.int8), dbg_kernel, mode='constant')
+        one_block_gap = ~dbg_edge_22xx & (dbg_edge_nbr >= 2)
+        dbg_dist_to_270 = distance_transform_edt(~dbg_marker_270x)
+        dbg_normal_area = dbg_dist_to_270 <= max_road_half_width
+        filled |= one_block_gap & dbg_normal_area
+        for _ in range(3):
+            dbg_nbr = convolve(filled.astype(np.int8), dbg_kernel, mode='constant')
+            filled |= ~filled & (dbg_nbr >= 3) & dbg_normal_area
 
         # 背景として redstone_block (値1) を設定
         # 0=なし, 1=redstone_block, 2=glowstone(270x),
