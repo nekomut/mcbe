@@ -463,31 +463,17 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
         elif 2700 <= ft_code < 2800:
             rasterize_to_mask(mc_coords, all_road_lines, val=True)
 
-    # 22xx + 270x をエッジとして領域分割し、両方に接する領域 = 道路面
+    # 22xx で区切られた領域をラベリングし、270x を含む領域 = 道路面
     from scipy.ndimage import binary_dilation, convolve
-    combined_edges = edge_22xx | marker_270x
-    struct = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
-    regions, n_regions = ndimage_label(~combined_edges, structure=struct)
-    dilated_22 = binary_dilation(edge_22xx, structure=struct)
-    dilated_270 = binary_dilation(marker_270x, structure=struct)
-    labels_near_22 = set(np.unique(regions[dilated_22 & (regions > 0)]))
-    labels_near_270 = set(np.unique(regions[dilated_270 & (regions > 0)]))
-    road_labels = labels_near_22 & labels_near_270
-    # 不適切な領域を除外:
-    # - 幅1以下: 22xx-270x が隣接する細い道
-    # - エッジで囲まれていない巨大領域: max_dist_to_edge > max_road_half_width * 2
-    dist_to_edge = distance_transform_edt(~combined_edges)
-    exclude_labels = set()
-    for rid in road_labels:
-        region_dist = dist_to_edge[regions == rid]
-        if region_dist.max() <= 1 or region_dist.max() > max_road_half_width * 2:
-            exclude_labels.add(rid)
-    road_labels -= exclude_labels
-    road_side = np.isin(regions, list(road_labels)) if road_labels else np.zeros(shape, dtype=bool)
+    regions, n_regions = ndimage_label(~edge_22xx)
+    road_region_ids = set(np.unique(regions[marker_270x]))
+    road_region_ids.discard(0)
+    road_side = np.isin(regions, list(road_region_ids)) if road_region_ids else np.zeros(shape, dtype=bool)
     # 22xx からの距離で制限
     dist_to_22 = distance_transform_edt(~edge_22xx)
     road_filled = road_side & (dist_to_22 <= max_road_half_width)
-    road_filled |= combined_edges
+    road_filled |= edge_22xx & (dist_to_22 == 0)  # 22xx 自体も含める
+    road_filled |= marker_270x  # 270x 自体も含める
     # 細い道（271x-273x）は線のみ道路扱い
     road_filled |= all_road_lines
 
@@ -503,36 +489,12 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
         road_filled |= ~road_filled & (rs_nbr >= 3) & normal_road_area
 
     print(f"  道路縁線: 22xx={int(edge_22xx.sum())}, 270x={int(marker_270x.sum())}, "
-          f"領域: {len(road_labels)}/{n_regions}")
+          f"領域: {len(road_region_ids)}/{n_regions}")
 
-    # 除外マスク
-    exclude = water_mask.copy()
-    if buildingmap is not None:
-        exclude |= buildingmap.astype(bool)
-
-    # 橋 = 道路が水域を横断する箇所
-    bridge_mask = np.zeros(shape, dtype=bool)
+    # 橋 = 道路が水域を横断する箇所（road_filled と水域の重なり）
+    bridge_mask = road_filled & water_mask
     if road_filled.any():
-        bridge_seed = road_filled & water_mask
-        if bridge_seed.any():
-            # 岸の道路幅で橋を膨張
-            # 水域を道路の延長とみなし、陸側の真の道路境界からの距離 = 道路半幅
-            road_or_water = road_filled | water_mask
-            dist_to_true_edge = distance_transform_edt(road_or_water)
-            shore_road = road_filled & ~water_mask
-            if shore_road.any():
-                shore_dist, shore_idx = distance_transform_edt(
-                    ~shore_road, return_distances=True, return_indices=True)
-                # 最寄り岸道路セルでの道路半幅（水域を無視した真のエッジからの距離）
-                shore_hw = dist_to_true_edge[shore_idx[0], shore_idx[1]]
-                shore_hw = np.minimum(shore_hw, max_road_half_width)
-                bridge_dist = distance_transform_edt(~bridge_seed)
-                bridge_mask = water_mask & (bridge_dist <= shore_hw)
-            else:
-                bridge_mask = bridge_seed
-        if buildingmap is not None:
-            bridge_mask &= ~buildingmap.astype(bool)
-        surface[road_filled & ~exclude] = SURFACE_ROAD
+        surface[road_filled & ~water_mask] = SURFACE_ROAD
 
     road_count = int((surface == SURFACE_ROAD).sum())
     bridge_count = int(bridge_mask.sum())
@@ -581,7 +543,7 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
             dbg_nbr = convolve(filled.astype(np.int8), dbg_kernel, mode='constant')
             filled |= ~filled & (dbg_nbr >= 3) & dbg_normal_area
 
-        # 背景として redstone_lamp (値3) を設定
+        # 背景として lit_pumpkin (値7) を設定
         # 0=なし, 1=redstone_block(22xx), 2=glowstone(270x),
         # 3=redstone_lamp(222x), 4=pearlescent_froglight(271x),
         # 5=verdant_froglight(272x), 6=ochre_froglight(273x),

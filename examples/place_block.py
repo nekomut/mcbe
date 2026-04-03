@@ -40,7 +40,6 @@ BUILDINGMAP_CSV = os.path.join(os.path.dirname(__file__), "buildingmap.csv")
 PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "heightmap.progress")
 BUILDING_PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "building.progress")
 BUILDING_BLOCK_TYPE = "quartz_block"
-BRIDGE_BLOCK_TYPE = "stone"
 SCALE = 0.75  # メートル/ブロック — plot_dem3d.py と一致させること
 BUILDING_HEIGHT = int(round(5.0 / SCALE))   # 物理5m → 7ブロック
 BRIDGE_THICKNESS = 2                        # 橋の厚み（ブロック数）
@@ -199,7 +198,7 @@ async def bot_worker(
         for i, z in enumerate(rows):
             mc_z = z + z_offset
             if phase == "terrain":
-                # heightmap は半ブロック単位。h=フルブロック高, slab=上にハーフブロック
+                # 草地・水域フェーズ: 全セルを草地または水域として配置
                 await run_cmd(f"/tp {name} {x_offset} {CLEAR_HEIGHT} {mc_z}")
                 for x in range(size_x):
                     h_half = heightmap[z][x]
@@ -207,42 +206,80 @@ async def bot_worker(
                     if h_half >= 0:
                         h = h_half // 2       # フルブロック高
                         slab = h_half % 2     # 1ならスラブあり
-                        # 水域はスラブ不要
-                        if block_at(z, x) == "water":
-                            slab = 0
-                        top = h + slab        # 最上位の Y 座標
                         block = block_at(z, x)
+                        # 草地・水域フェーズでは道路も草地として配置
+                        if block == "stone":
+                            block = "grass_block"
+                        # 水域はスラブ不要
+                        if block == "water":
+                            slab = 0
+                        top = h + slab
                         await run_cmd(f"/tp {name} {mc_x} {top + 5} {mc_z}")
+                        # 標高±3ブロックを air に置換
+                        air_bottom = max(0, h - 3)
+                        air_top = h + 3
+                        await run_cmd(f"/fill {mc_x} {air_bottom} {mc_z} {mc_x} {air_top} {mc_z} air")
                         if block == "water" and h >= 9:
                             # 水域: 上4=air, 5~7=water, 8~9=grass_block, 10以下=stone
                             await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h - 9} {mc_z} stone")
                             await run_cmd(f"/fill {mc_x} {h - 8} {mc_z} {mc_x} {h - 7} {mc_z} grass_block")
                             await run_cmd(f"/fill {mc_x} {h - 6} {mc_z} {mc_x} {h - 4} {mc_z} water")
                             await run_cmd(f"/fill {mc_x} {h - 3} {mc_z} {mc_x} {h} {mc_z} air")
-                        elif block == "stone" and h >= 5:
-                            # 道路: 上3=stone, 4~5=grass_block, 6以下=stone
-                            await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h - 5} {mc_z} stone")
-                            await run_cmd(f"/fill {mc_x} {h - 4} {mc_z} {mc_x} {h - 3} {mc_z} grass_block")
-                            await run_cmd(f"/fill {mc_x} {h - 2} {mc_z} {mc_x} {h} {mc_z} stone")
                         elif block == "grass_block" and h >= 4:
                             # 草地: 上4=grass_block, 5以下=stone
                             await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h - 4} {mc_z} stone")
                             await run_cmd(f"/fill {mc_x} {h - 3} {mc_z} {mc_x} {h} {mc_z} grass_block")
                         else:
                             await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h} {mc_z} {block}")
-                        # ハーフブロック配置
+                        # ハーフブロック配置（草地のみ）
                         if slab and block == "grass_block":
                             await run_cmd(
                                 f"/setblock {mc_x} {h + 1} {mc_z} mossy_cobblestone_slab"
-                            )
-                        elif slab and block == "stone":
-                            await run_cmd(
-                                f"/setblock {mc_x} {h + 1} {mc_z} normal_stone_slab"
                             )
                         # 上空クリア
                         clear_from = top + 1
                         if clear_from <= CLEAR_HEIGHT:
                             await run_cmd(f"/fill {mc_x} {clear_from} {mc_z} {mc_x} {CLEAR_HEIGHT} {mc_z} air")
+            elif phase == "road":
+                # 道路・橋フェーズ: 道路セルを stone で上書き、橋セルも配置
+                h0 = (heightmap[z][0] // 2) + (heightmap[z][0] % 2)
+                await run_cmd(f"/tp {name} {x_offset} {h0 + 10} {mc_z}")
+                for x in range(size_x):
+                    mc_x = x + x_offset
+                    is_bridge = bridgemap is not None and bridgemap[z][x] > 0
+                    is_road = block_at(z, x) == "stone"
+                    if not (is_bridge or is_road):
+                        continue
+                    if is_bridge:
+                        h_half = bridgemap[z][x]
+                    else:
+                        h_half = heightmap[z][x]
+                        if h_half < 0:
+                            continue
+                    h = h_half // 2
+                    slab = h_half % 2
+                    top = h + slab
+                    await run_cmd(f"/tp {name} {mc_x} {top + 5} {mc_z}")
+                    # 標高±3ブロックを air に置換
+                    air_bottom = max(0, h - 3)
+                    air_top = h + 3
+                    await run_cmd(f"/fill {mc_x} {air_bottom} {mc_z} {mc_x} {air_top} {mc_z} air")
+                    if is_bridge:
+                        # 橋: 上2ブロック andesite
+                        if h >= 1:
+                            await run_cmd(f"/fill {mc_x} {h - 1} {mc_z} {mc_x} {h} {mc_z} andesite")
+                        else:
+                            await run_cmd(f"/setblock {mc_x} 0 {mc_z} andesite")
+                    else:
+                        # 道路: 上2=andesite, 3~4=dirt, 5以下=stone
+                        if h >= 5:
+                            await run_cmd(f"/fill {mc_x} {h - 3} {mc_z} {mc_x} {h - 2} {mc_z} dirt")
+                            await run_cmd(f"/fill {mc_x} {h - 1} {mc_z} {mc_x} {h} {mc_z} andesite")
+                        else:
+                            await run_cmd(f"/fill {mc_x} 0 {mc_z} {mc_x} {h} {mc_z} andesite")
+                    # ハーフブロック配置
+                    if slab:
+                        await run_cmd(f'/setblock {mc_x} {h + 1} {mc_z} stone_block_slab2 ["stone_slab_type_2"="andesite"]')
             elif phase == "building" and buildingmap is not None:
                 # 建物配置（heightmap は半ブロック単位）
                 h0 = (heightmap[z][0] // 2) + (heightmap[z][0] % 2)
@@ -260,26 +297,6 @@ async def bot_worker(
                             await run_cmd(
                                 f"/fill {mc_x} {y_bottom} {mc_z} {mc_x} {y_top} {mc_z} {BUILDING_BLOCK_TYPE}"
                             )
-            elif phase == "bridge" and bridgemap is not None:
-                # 橋配置: bridgemap の高さ（半ブロック単位）で stone を敷く
-                # heightmap は水面レベル、bridgemap が道路レベルの高さを持つ
-                h0 = (heightmap[z][0] // 2) + (heightmap[z][0] % 2)
-                await run_cmd(f"/tp {name} {x_offset} {h0 + 10} {mc_z}")
-                for x in range(size_x):
-                    bridge_h_half = bridgemap[z][x]
-                    if bridge_h_half > 0:
-                        mc_x = x + x_offset
-                        h = bridge_h_half // 2
-                        slab = bridge_h_half % 2
-                        top = h + slab
-                        await run_cmd(f"/tp {name} {mc_x} {top + 5} {mc_z}")
-                        # 橋面: 最大2ブロックの stone
-                        if h >= 1:
-                            await run_cmd(f"/fill {mc_x} {h - 1} {mc_z} {mc_x} {h} {mc_z} stone")
-                        else:
-                            await run_cmd(f"/setblock {mc_x} 0 {mc_z} stone")
-                        if slab:
-                            await run_cmd(f"/setblock {mc_x} {h + 1} {mc_z} normal_stone_slab")
             elif phase == "centerline" and centerlinemap is not None:
                 # まず既存のレッドストーンを stone に置換、その後新しいレッドストーンを配置
                 h0 = (heightmap[z][0] // 2) + (heightmap[z][0] % 2)
@@ -381,13 +398,13 @@ async def main(address: str, num_bots: int, *, reset: bool = False, no_building:
     if centerlinemap:
         logger.info("中心線マップ: あり (レッドストーン配置)")
 
-    BRIDGE_PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "bridge.progress")
+    ROAD_PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "road.progress")
     CENTERLINE_PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "centerline.progress")
 
-    # フェーズ判定: 地形 → 建物 → 橋 → 中心線 の順に実行
+    # フェーズ判定: 地形 → 道路・橋 → 建物 → 中心線 の順に実行
     if reset:
-        for pf in [PROGRESS_FILE, BUILDING_PROGRESS_FILE, BRIDGE_PROGRESS_FILE,
-                    CENTERLINE_PROGRESS_FILE]:
+        for pf in [PROGRESS_FILE, ROAD_PROGRESS_FILE,
+                    BUILDING_PROGRESS_FILE, CENTERLINE_PROGRESS_FILE]:
             if os.path.exists(pf):
                 os.remove(pf)
         logger.info("進捗リセット")
@@ -402,13 +419,13 @@ async def main(address: str, num_bots: int, *, reset: bool = False, no_building:
         else:
             logger.info("地形: 全行配置済み")
 
-        if bridgemap:
-            bridge_done = load_progress(BRIDGE_PROGRESS_FILE) if not reset else set()
-            bridge_remaining = [z for z in range(size_z) if z not in bridge_done]
-            if bridge_remaining:
-                phases.append(("bridge", bridge_remaining, BRIDGE_PROGRESS_FILE))
+        if surfacemap or bridgemap:
+            road_done = load_progress(ROAD_PROGRESS_FILE) if not reset else set()
+            road_remaining = [z for z in range(size_z) if z not in road_done]
+            if road_remaining:
+                phases.append(("road", road_remaining, ROAD_PROGRESS_FILE))
             else:
-                logger.info("橋: 全行配置済み")
+                logger.info("道路・橋: 全行配置済み")
 
         if buildingmap and not no_building:
             building_done = load_progress(BUILDING_PROGRESS_FILE) if not reset else set()
