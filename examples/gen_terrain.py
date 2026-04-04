@@ -326,7 +326,7 @@ def fetch_vectors(origin_lat: float, origin_lon: float,
         blocks_per_deg_lat, blocks_per_deg_lon,
         VECTOR_ZOOM_EXTRA, {"road"})
 
-    road_lines: list[tuple[list, int, int]] = []
+    road_lines: list[tuple[list, int, int, int]] = []
     water_polys: list[list] = []
     building_polys: list[list] = []
 
@@ -351,8 +351,9 @@ def fetch_vectors(origin_lat: float, origin_lon: float,
             if not (2200 <= ft < 2300 or 2400 <= ft < 2500 or 2700 <= ft < 2800):
                 continue
             rdctg = props.get("rdCtg", -1)
+            rnkw = props.get("rnkWidth", -1)
             for line in extract_lines(geom):
-                road_lines.append((line, ft, rdctg))
+                road_lines.append((line, ft, rdctg, rnkw))
         elif layer_name == "waterarea":
             water_polys.extend(extract_polys(geom))
         elif layer_name == "building":
@@ -367,8 +368,9 @@ def fetch_vectors(origin_lat: float, origin_lon: float,
             if not (2200 <= ft < 2300 or 2400 <= ft < 2500 or 2700 <= ft < 2800):
                 continue
             rdctg = props.get("rdCtg", -1)
+            rnkw = props.get("rnkWidth", -1)
             for line in extract_lines(geom):
-                road_lines.append((line, ft, rdctg))
+                road_lines.append((line, ft, rdctg, rnkw))
 
     z16_count = len(road_lines) - z15_count
     print(f"  道路縁線 z={VECTOR_ZOOM_EDGE}: {z15_count} 本")
@@ -443,7 +445,7 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
         print(f"建物セル: 0/{ny * nx}")
 
     # --- 道路 (領域ラベリング法) ---
-    max_road_half_width = 5.0 / scale
+    max_road_half_width = 6.6 / scale
 
     def rasterize_to_mask(mc_coords, arr, val=True):
         """線分を配列にラスタライズ."""
@@ -467,15 +469,19 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
     marker_270x = np.zeros(shape, dtype=bool)
     marker_main_road = np.zeros(shape, dtype=bool)  # rdCtg 0-3 の道路線
     all_road_lines = np.zeros(shape, dtype=bool)  # 全道路線（27xx 含む）
-    for mc_coords, ft_code, rdctg in road_lines:
+    for mc_coords, ft_code, rdctg, rnkw in road_lines:
         if 2200 <= ft_code < 2300 or 2400 <= ft_code < 2500:
             rasterize_to_mask(mc_coords, edge_22xx, val=True)
             rasterize_to_mask(mc_coords, all_road_lines, val=True)
         elif 2700 <= ft_code < 2710:
-            rasterize_to_mask(mc_coords, marker_270x, val=True)
-            rasterize_to_mask(mc_coords, all_road_lines, val=True)
-            if rdctg in (0, 1, 3):
-                rasterize_to_mask(mc_coords, marker_main_road, val=True)
+            if rdctg == 5 and rnkw == 0:
+                # 細い道（rdCtg=5, rnkWidth=0）は領域充填せず線のみ
+                rasterize_to_mask(mc_coords, all_road_lines, val=True)
+            else:
+                rasterize_to_mask(mc_coords, marker_270x, val=True)
+                rasterize_to_mask(mc_coords, all_road_lines, val=True)
+                if rdctg in (0, 1, 3):
+                    rasterize_to_mask(mc_coords, marker_main_road, val=True)
         elif 2700 <= ft_code < 2800:
             rasterize_to_mask(mc_coords, all_road_lines, val=True)
 
@@ -541,14 +547,14 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
     if debug:
         # 22xx/24xx（道路縁線）
         dbg_edge_22xx = np.zeros(shape, dtype=bool)
-        for mc_coords, ft_code, _ in road_lines:
+        for mc_coords, ft_code, _, _ in road_lines:
             if 2200 <= ft_code < 2300 or 2400 <= ft_code < 2500:
                 rasterize_to_mask(mc_coords, dbg_edge_22xx, val=True)
 
-        # 270x のみ（通常道路）— 細い道 271x-273x は充填対象外
+        # 270x のみ（通常道路）— 細い道 271x-273x と rdCtg=5/rnkWidth=0 は充填対象外
         dbg_marker_270x = np.zeros(shape, dtype=bool)
-        for mc_coords, ft_code, _ in road_lines:
-            if 2700 <= ft_code < 2710:
+        for mc_coords, ft_code, rdctg, rnkw in road_lines:
+            if 2700 <= ft_code < 2710 and not (rdctg == 5 and rnkw == 0):
                 rasterize_to_mask(mc_coords, dbg_marker_270x, val=True)
 
         # 22xx で区切られた領域をラベリング
@@ -584,7 +590,7 @@ def gen_maps(road_lines: list, water_polys: list, building_polys: list,
 
         # ftCode 別ライン描画（背景を上書き）
         ft_counts: dict[int, int] = {}
-        for mc_coords, ft_code, _ in road_lines:
+        for mc_coords, ft_code, _, _ in road_lines:
             if 2700 <= ft_code < 2710:
                 v = 2
             elif 2710 <= ft_code < 2720:
