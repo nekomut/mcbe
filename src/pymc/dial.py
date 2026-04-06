@@ -15,8 +15,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from pymc.conn import Connection
 from pymc.network import Network, TCPNetwork
 from pymc.proto.encryption import compute_shared_secret, derive_key
-from pymc.proto.login.data import ClientData, GameData, IdentityData
+from pymc.proto.login.data import ClientData, GameData, IdentityData, default_client_data
 from pymc.proto.login.request import (
+    encode_authenticated,
     encode_offline,
     marshal_public_key,
     parse_public_key,
@@ -72,22 +73,22 @@ class Dialer:
         chunk_radius: int = 16,
         network: Network | None = None,
         legacy_login: bool = False,
+        login_chain: str | None = None,
+        auth_key: ec.EllipticCurvePrivateKey | None = None,
+        multiplayer_token: str = "",
     ) -> None:
         self.identity_data = identity_data or IdentityData(
             display_name="Steve",
             identity=str(uuid.uuid4()),
         )
-        self.client_data = client_data or ClientData(
-            game_version="1.26.11",
-            language_code="en_US",
-            device_os=7,  # Windows 10
-            device_model="pymc",
-            device_id=str(uuid.uuid4()),
-        )
+        self.client_data = client_data or default_client_data()
         self.protocol_version = protocol_version
         self.flush_rate = flush_rate
         self.chunk_radius = chunk_radius
         self.legacy_login = legacy_login
+        self.login_chain = login_chain
+        self.auth_key = auth_key
+        self.multiplayer_token = multiplayer_token
         self._network = network or TCPNetwork()
 
     async def dial(self, address: str) -> Connection:
@@ -99,18 +100,28 @@ class Dialer:
         Returns:
             An established Connection ready for gameplay packets.
         """
-        # Generate ECDSA P-384 key pair.
-        private_key = ec.generate_private_key(ec.SECP384R1())
+        # Use auth key if provided (must match the key used to request the login chain),
+        # otherwise generate a new ECDSA P-384 key pair.
+        private_key = self.auth_key or ec.generate_private_key(ec.SECP384R1())
 
         # Connect transport.
         transport = await self._network.connect(address)
 
+        # Detect NetherNet transport (WebRTC): skip batch header and
+        # Minecraft-layer encryption (DTLS handles encryption).
+        from pymc.nethernet.conn import NetherNetConn
+        is_nethernet = isinstance(transport, NetherNetConn)
+
         pool = server_pool()
-        conn = Connection(transport, pool, flush_rate=self.flush_rate)
+        conn = Connection(
+            transport, pool, flush_rate=self.flush_rate,
+            use_batch_header=not is_nethernet,
+            disable_encryption=is_nethernet,
+        )
         await conn.start()
 
         try:
-            await self._handshake(conn, private_key)
+            await self._handshake(conn, private_key, address)
         except Exception:
             await conn.close()
             raise
@@ -118,7 +129,8 @@ class Dialer:
         return conn
 
     async def _handshake(
-        self, conn: Connection, private_key: ec.EllipticCurvePrivateKey
+        self, conn: Connection, private_key: ec.EllipticCurvePrivateKey,
+        address: str = "",
     ) -> None:
         """Perform the full client login handshake."""
         # 1. Send RequestNetworkSettings.
@@ -131,11 +143,23 @@ class Dialer:
         conn.enable_compression(pk.compression_algorithm, pk.compression_threshold)
 
         # 3. Send Login.
-        self.client_data.server_address = ""
-        connection_request = encode_offline(
-            self.identity_data, self.client_data, private_key,
-            legacy=self.legacy_login,
-        )
+        self.client_data.server_address = address
+        if not self.client_data.third_party_name:
+            self.client_data.third_party_name = self.identity_data.display_name
+        if self.login_chain:
+            # Authenticated login: enforce Android device data to match
+            # the titleId in the Xbox Live JWT chain (same as gophertunnel).
+            self.client_data.device_os = 1  # Android
+        if self.login_chain:
+            connection_request = encode_authenticated(
+                self.login_chain, self.client_data, private_key,
+                multiplayer_token=self.multiplayer_token,
+            )
+        else:
+            connection_request = encode_offline(
+                self.identity_data, self.client_data, private_key,
+                legacy=self.legacy_login,
+            )
         await conn.write_packet(
             Login(
                 client_protocol=self.protocol_version,
@@ -160,6 +184,15 @@ class Dialer:
             # 5. Send ClientToServerHandshake.
             await conn.write_packet(ClientToServerHandshake())
             await conn.flush()
+
+            # 5b. Wait for PlayStatus(LoginSuccess).
+            pk = await self._expect(conn, PlayStatus, timeout=10.0)
+            logger.info("handshake: PlayStatus=%d", pk.status)
+
+        # 5c. Send ClientCacheStatus (required by server before ResourcePacksInfo).
+        from pymc.proto.packet.client_cache_status import ClientCacheStatus
+        await conn.write_packet(ClientCacheStatus(enabled=False))
+        await conn.flush()
 
         # 6. Handle resource packs.
         await self._handle_resource_packs(conn)
@@ -236,13 +269,15 @@ class Dialer:
 
         while True:
             pk = await asyncio.wait_for(conn.read_packet(), timeout=30.0)
+            logger.debug("spawn: received %s", type(pk).__name__)
 
             if isinstance(pk, PlayStatus):
+                logger.info("spawn: PlayStatus=%d", pk.status)
                 if pk.status == STATUS_PLAYER_SPAWN:
                     break
 
             elif isinstance(pk, ChunkRadiusUpdated):
-                pass  # Server confirmed chunk radius.
+                logger.info("spawn: ChunkRadiusUpdated=%d", pk.chunk_radius)
 
             else:
                 # Other packets (StartGame, etc.) - send chunk radius if not yet.
@@ -263,11 +298,21 @@ class Dialer:
         timeout: float = 10.0,
     ) -> Packet:
         """Read packets until we get the expected type."""
+        from pymc.proto.packet.disconnect import Disconnect
+        from pymc.proto.packet.packet_violation_warning import PacketViolationWarning
         while True:
             pk = await asyncio.wait_for(conn.read_packet(), timeout=timeout)
             if isinstance(pk, packet_type):
                 return pk
-            logger.debug("skipping unexpected packet: %s", type(pk).__name__)
+            if isinstance(pk, Disconnect):
+                logger.error("Disconnect while expecting %s: reason=%d message=%s",
+                             packet_type.__name__, pk.reason, pk.message)
+            elif isinstance(pk, PacketViolationWarning):
+                logger.error("PacketViolationWarning while expecting %s: type=%d severity=%d packet=%d ctx=%s",
+                             packet_type.__name__, pk.violation_type, pk.severity,
+                             pk.violating_packet_id, pk.violation_context)
+            else:
+                logger.debug("skipping unexpected packet: %s", type(pk).__name__)
 
     @staticmethod
     async def _expect_any(
@@ -276,8 +321,16 @@ class Dialer:
         timeout: float = 10.0,
     ) -> Packet:
         """Read packets until we get one of the expected types."""
+        from pymc.proto.packet.packet_violation_warning import PacketViolationWarning
+        from pymc.proto.packet.disconnect import Disconnect
         while True:
             pk = await asyncio.wait_for(conn.read_packet(), timeout=timeout)
             if isinstance(pk, packet_types):
                 return pk
-            logger.debug("skipping unexpected packet: %s", type(pk).__name__)
+            if isinstance(pk, PacketViolationWarning):
+                logger.error("PacketViolationWarning: type=%d severity=%d violating_packet=%d context=%s",
+                             pk.violation_type, pk.severity, pk.violating_packet_id, pk.violation_context)
+            elif isinstance(pk, Disconnect):
+                logger.error("Disconnect: reason=%d message=%s", pk.reason, pk.message)
+            else:
+                logger.debug("skipping unexpected packet: %s", type(pk).__name__)

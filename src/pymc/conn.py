@@ -16,7 +16,7 @@ from pymc.proto.pool import (
     COMPRESSION_FLATE,
     Packet,
     PacketPool,
-    UnknownPacket,
+
     decode_batch,
     decode_packet,
     encode_batch,
@@ -64,10 +64,14 @@ class Connection:
         pool: PacketPool,
         *,
         flush_rate: float = DEFAULT_FLUSH_RATE,
+        use_batch_header: bool = True,
+        disable_encryption: bool = False,
     ) -> None:
         self._transport = transport
         self._pool = pool
         self._flush_rate = flush_rate
+        self._use_batch_header = use_batch_header
+        self._disable_encryption = disable_encryption
 
         # Compression settings.
         self._compression: int | None = None
@@ -116,6 +120,8 @@ class Connection:
 
     def enable_encryption(self, key: bytes) -> None:
         """Enable AES-256-CTR encryption with the given 32-byte key."""
+        if self._disable_encryption:
+            return
         self._encrypt = PacketEncrypt(key)
         self._decrypt = PacketDecrypt(key)
 
@@ -140,6 +146,7 @@ class Connection:
                 to_send,
                 compression=self._compression,
                 compression_threshold=self._compression_threshold,
+                use_batch_header=self._use_batch_header,
             )
         )
 
@@ -156,6 +163,7 @@ class Connection:
                 [data],
                 compression=self._compression,
                 compression_threshold=self._compression_threshold,
+                use_batch_header=self._use_batch_header,
             )
         )
         if self._encrypt is not None:
@@ -241,10 +249,11 @@ class Connection:
                 try:
                     packets = self._decode_raw_batch(raw)
                 except Exception as e:
-                    logger.warning("decode error: %s", e)
+                    logger.warning("decode error (len=%d hex=%s): %s", len(raw), raw[:40].hex(), e)
                     continue
 
                 for pk in packets:
+                    logger.debug("queued packet: %s (id=%d)", type(pk).__name__, pk.packet_id)
                     await self._recv_queue.put(pk)
 
         except asyncio.CancelledError:
@@ -262,7 +271,8 @@ class Connection:
             data = bytearray([data[0]]) + bytearray(plaintext)
 
         packet_list = decode_batch(
-            bytes(data), compression=self._compression
+            bytes(data), compression=self._compression,
+            use_batch_header=self._use_batch_header,
         )
 
         results: list[Packet] = []

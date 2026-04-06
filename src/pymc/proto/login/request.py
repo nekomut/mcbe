@@ -130,45 +130,54 @@ def encode_offline(
 
 
 def _build_client_dict(client_data: ClientData) -> dict:
-    """Build client data claims dictionary for JWT."""
+    """Build client data claims dictionary for JWT.
+
+    JSON field names must match gophertunnel's Go struct tags exactly.
+    """
     return {
-        "GameVersion": client_data.game_version,
-        "ServerAddress": client_data.server_address,
-        "LanguageCode": client_data.language_code,
-        "DeviceOS": client_data.device_os,
-        "DeviceModel": client_data.device_model,
-        "DeviceId": client_data.device_id,
-        "ClientRandomId": client_data.client_random_id,
-        "CurrentInputMode": client_data.current_input_mode,
-        "DefaultInputMode": client_data.default_input_mode,
-        "GuiScale": client_data.gui_scale,
-        "UIProfile": client_data.ui_profile,
-        "IsEditorMode": client_data.is_editor_mode,
-        "SkinId": client_data.skin_id,
-        "SkinData": client_data.skin_data,
-        "SkinImageHeight": client_data.skin_image_height,
-        "SkinImageWidth": client_data.skin_image_width,
-        "SkinResourcePatch": client_data.skin_resource_patch,
-        "SkinGeometry": client_data.skin_geometry,
-        "SkinGeometryVersion": client_data.skin_geometry_version,
-        "SkinColour": client_data.skin_colour,
+        "AnimatedImageData": [],
         "ArmSize": client_data.arm_size,
         "CapeData": client_data.cape_data,
         "CapeId": client_data.cape_id,
         "CapeImageHeight": client_data.cape_image_height,
         "CapeImageWidth": client_data.cape_image_width,
         "CapeOnClassicSkin": client_data.cape_on_classic_skin,
-        "PersonaSkin": client_data.persona_skin,
-        "PremiumSkin": client_data.premium_skin,
-        "TrustedSkin": client_data.trusted_skin,
-        "SelfSignedId": client_data.self_signed_id or str(uuid.uuid4()),
-        "PlatformOfflineId": client_data.platform_offline_id,
-        "PlatformOnlineId": client_data.platform_online_id,
-        "ThirdPartyName": client_data.third_party_name,
-        "PlayFabId": client_data.playfab_id,
+        "ClientRandomId": client_data.client_random_id,
         "CompatibleWithClientSideChunkGen": client_data.compatible_with_client_side_chunk_gen,
+        "CurrentInputMode": client_data.current_input_mode,
+        "DefaultInputMode": client_data.default_input_mode,
+        "DeviceId": client_data.device_id,
+        "DeviceModel": client_data.device_model,
+        "DeviceOS": client_data.device_os,
+        "GameVersion": client_data.game_version,
+        "GuiScale": client_data.gui_scale,
+        "IsEditorMode": client_data.is_editor_mode,
+        "LanguageCode": client_data.language_code,
         "MaxViewDistance": client_data.max_view_distance,
         "MemoryTier": client_data.memory_tier,
+        "OverrideSkin": False,
+        "PersonaPieces": [],
+        "PersonaSkin": client_data.persona_skin,
+        "PieceTintColors": [],
+        "PlatformOfflineId": client_data.platform_offline_id,
+        "PlatformOnlineId": client_data.platform_online_id,
+        "PlatformUserId": client_data.platform_user_id,
+        "PlayFabId": client_data.playfab_id,
+        "PremiumSkin": client_data.premium_skin,
+        "SelfSignedId": client_data.self_signed_id or str(uuid.uuid4()),
+        "ServerAddress": client_data.server_address,
+        "SkinAnimationData": "",
+        "SkinColor": client_data.skin_colour,
+        "SkinData": client_data.skin_data,
+        "SkinGeometryData": client_data.skin_geometry,
+        "SkinGeometryDataEngineVersion": client_data.skin_geometry_version,
+        "SkinId": client_data.skin_id,
+        "SkinImageHeight": client_data.skin_image_height,
+        "SkinImageWidth": client_data.skin_image_width,
+        "SkinResourcePatch": client_data.skin_resource_patch,
+        "ThirdPartyName": client_data.third_party_name,
+        "TrustedSkin": client_data.trusted_skin,
+        "UIProfile": client_data.ui_profile,
     }
 
 
@@ -180,8 +189,13 @@ def encode_authenticated(
 ) -> bytes:
     """Create an authenticated login request using an Xbox Live JWT chain.
 
+    Mirrors gophertunnel's login.Encode. Prepends a self-signed JWT to the
+    chain (linking our key to the first chain JWT's key), then wraps the
+    chain in the ``{"Certificate": "...", "AuthenticationType": 2, "Token": "..."}``
+    request format expected by the server.
+
     Args:
-        login_chain: JWT chain from Minecraft authentication service.
+        login_chain: JWT chain JSON from Minecraft authentication service.
         client_data: Client device/skin data.
         private_key: ECDSA P-384 private key.
         multiplayer_token: Optional multiplayer correlation token.
@@ -189,38 +203,63 @@ def encode_authenticated(
     Returns:
         connection_request bytes for the Login packet.
     """
-    public_key_b64 = marshal_public_key(private_key.public_key())
+    import jwt as pyjwt
 
-    # Build client data JWT.
-    client_dict = {
-        "GameVersion": client_data.game_version,
-        "ServerAddress": client_data.server_address,
-        "LanguageCode": client_data.language_code,
-        "DeviceOS": client_data.device_os,
-        "DeviceModel": client_data.device_model,
-        "DeviceId": client_data.device_id,
-        "ClientRandomId": client_data.client_random_id,
-        "CurrentInputMode": client_data.current_input_mode,
-        "DefaultInputMode": client_data.default_input_mode,
-        "GuiScale": client_data.gui_scale,
-        "UIProfile": client_data.ui_profile,
+    public_key_b64 = marshal_public_key(private_key.public_key())
+    now = int(time.time())
+    signer_headers = {"x5u": public_key_b64}
+
+    # Parse the existing chain from the auth service.
+    chain_data = json.loads(login_chain)
+    chain_tokens: list[str] = chain_data.get("chain", [])
+
+    # Extract x5u (public key) from the first chain JWT header.
+    # This links our self-signed JWT to the auth service's chain.
+    first_x5u = ""
+    if chain_tokens:
+        first_header = pyjwt.get_unverified_header(chain_tokens[0])
+        first_x5u = first_header.get("x5u", "")
+
+    # Create a self-signed JWT that bridges our key to the chain.
+    bridge_claims = {
+        "nbf": now - 21600,
+        "exp": now + 21600,
+        "identityPublicKey": first_x5u,
+        "certificateAuthority": True,
+    }
+    bridge_jwt = jwt.encode(
+        bridge_claims, private_key,
+        algorithm="ES384", headers=signer_headers,
+    )
+
+    # Prepend our JWT to the chain.
+    full_chain = [bridge_jwt] + chain_tokens
+    cert_json = json.dumps({"chain": full_chain}, separators=(",", ":"))
+
+    # Build the request object (non-legacy format).
+    # AuthenticationType=0 for authenticated login (2 is for offline/OIDC).
+    request_obj = {
+        "Certificate": cert_json,
+        "AuthenticationType": 0,
+        "Token": multiplayer_token,
     }
 
-    client_token = jwt.encode(
-        client_dict,
-        private_key,
-        algorithm="ES384",
-        headers={"x5u": public_key_b64},
+    # Build client data JWT (full client data, same as encode_offline).
+    client_dict = _build_client_dict(client_data)
+    raw_token = jwt.encode(
+        client_dict, private_key,
+        algorithm="ES384", headers=signer_headers,
     )
-    client_token_bytes = client_token.encode()
 
-    chain_json = login_chain.encode()
+    # Assemble: [le32 len(request_json)][request_json][le32 len(raw_token)][raw_token]
+    request_json = json.dumps(request_obj, separators=(",", ":")).encode()
+    raw_token_bytes = raw_token.encode() if isinstance(raw_token, str) else raw_token
 
     result = bytearray()
-    result.extend(struct.pack("<I", len(chain_json)))
-    result.extend(chain_json)
-    result.extend(struct.pack("<I", len(client_token_bytes)))
-    result.extend(client_token_bytes)
+    result.extend(struct.pack("<i", len(request_json)))
+    result.extend(request_json)
+    result.extend(struct.pack("<i", len(raw_token_bytes)))
+    result.extend(raw_token_bytes)
     return bytes(result)
 
 

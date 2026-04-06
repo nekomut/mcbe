@@ -126,6 +126,7 @@ def encode_batch(
     packets: list[bytes],
     compression: int | None = None,
     compression_threshold: int = 256,
+    use_batch_header: bool = True,
 ) -> bytes:
     """Encode a batch of pre-encoded packets into a single batch payload.
 
@@ -133,6 +134,7 @@ def encode_batch(
         packets: List of already-encoded packet bytes.
         compression: Compression algorithm ID. None = no compression.
         compression_threshold: Minimum size to apply compression.
+        use_batch_header: Whether to prepend the 0xFE batch header.
 
     Returns:
         The batch payload (header + optional compression ID + data).
@@ -144,7 +146,7 @@ def encode_batch(
         buf.write(pkt)
 
     data = buf.getvalue()
-    result = bytearray([BATCH_HEADER])
+    result = bytearray([BATCH_HEADER]) if use_batch_header else bytearray()
 
     if compression is not None:
         if len(data) < compression_threshold:
@@ -173,6 +175,7 @@ def decode_batch(
     data: bytes,
     compression: int | None = None,
     max_decompressed: int = 16 * 1024 * 1024,
+    use_batch_header: bool = True,
 ) -> list[bytes]:
     """Decode a batch payload into individual packet byte arrays.
 
@@ -180,15 +183,17 @@ def decode_batch(
         data: Raw batch payload.
         compression: Expected compression algorithm. None = no compression.
         max_decompressed: Maximum decompressed size.
+        use_batch_header: Whether the batch starts with a 0xFE header.
 
     Returns:
         List of raw packet bytes (each still needs decode_packet).
     """
     if len(data) == 0:
         return []
-    if data[0] != BATCH_HEADER:
-        raise ValueError(f"invalid batch header: 0x{data[0]:02x}, expected 0xfe")
-    data = data[1:]
+    if use_batch_header:
+        if data[0] != BATCH_HEADER:
+            raise ValueError(f"invalid batch header: 0x{data[0]:02x}, expected 0xfe")
+        data = data[1:]
 
     if compression is not None:
         comp_id = data[0]

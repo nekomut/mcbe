@@ -29,6 +29,14 @@ class Player:
 
 
 @dataclass
+class RealmAddress:
+    """Connection address returned by the Realms API."""
+
+    address: str = ""
+    network_protocol: str = ""  # "raknet" or "nethernet"
+
+
+@dataclass
 class Realm:
     """A Realm returned from the Realms API."""
 
@@ -56,7 +64,7 @@ class Realm:
 
     _client: RealmsClient | None = field(default=None, repr=False)
 
-    async def address(self) -> str:
+    async def address(self) -> RealmAddress:
         """Get the connection address for this Realm.
 
         Retries automatically while the Realm is starting up (HTTP 503).
@@ -64,7 +72,10 @@ class Realm:
         while True:
             try:
                 data = await self._client._request(f"/worlds/{self.id}/join")
-                return data["address"]
+                return RealmAddress(
+                    address=data.get("address", ""),
+                    network_protocol=data.get("networkProtocol", ""),
+                )
             except _RealmsHTTPError as e:
                 if e.status == 503:
                     await asyncio.sleep(3)

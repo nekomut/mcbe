@@ -26,6 +26,9 @@ import logging
 import os
 import time
 
+import jwt
+from cryptography.hazmat.primitives.asymmetric import ec
+
 from pymc.dial import Dialer
 from pymc.raknet import RakNetNetwork
 from pymc.proto.login.data import IdentityData
@@ -58,6 +61,19 @@ BOT_NAMES = [chr(ord("a") + i) for i in range(26)]
 # 各ボットに固定 UUID を割り当て
 BOT_UUIDS = [f"b1e3a2f4-5c6d-7e8f-9a0b-1c2d3e4f5{i:03x}" for i in range(26)]
 BOT_XUIDS = [f"{1000000000000000 + i}" for i in range(26)]
+
+
+def extract_gamertag(login_chain: str) -> str:
+    """login_chain JWT からゲーマータグ (displayName) を取得する."""
+    import json as _json
+    chain_data = _json.loads(login_chain)
+    for token in chain_data.get("chain", []):
+        claims = jwt.decode(token, options={"verify_signature": False})
+        extra = claims.get("extraData", {})
+        name = extra.get("displayName", "")
+        if name:
+            return name
+    return ""
 
 
 def load_terrain(json_path: str, csv_path: str) -> tuple[list[list[int]], list[list[int]] | None, list[list[int]] | None, list[list[int]] | None, list[list[int]] | None, list[list[int]] | None, int, int]:
@@ -117,12 +133,13 @@ def save_progress_line(path: str, z: int) -> None:
         f.write(f"{z}\n")
 
 
-async def connect_bot(bot_id: int, address: str) -> tuple:
+async def connect_bot(bot_id: int, address: str, *, login_chain: str | None = None, auth_key=None, multiplayer_token: str = "", network=None) -> tuple:
     """1体のボットを接続してコネクションを返す."""
     name = BOT_NAMES[bot_id]
     log = logging.getLogger(f"bot.{name}")
 
-    network = RakNetNetwork()
+    if network is None:
+        network = RakNetNetwork()
     dialer = Dialer(
         identity_data=IdentityData(
             display_name=name,
@@ -130,6 +147,9 @@ async def connect_bot(bot_id: int, address: str) -> tuple:
             xuid=BOT_XUIDS[bot_id],
         ),
         network=network,
+        login_chain=login_chain,
+        auth_key=auth_key,
+        multiplayer_token=multiplayer_token,
     )
 
     conn = await dialer.dial(address)
@@ -170,9 +190,11 @@ async def bot_worker(
     stats: dict,
     x_offset: int = 0,
     z_offset: int = 0,
+    *,
+    bot_name: str | None = None,
 ) -> None:
     """1体のボットが担当行のブロックを配置する."""
-    name = BOT_NAMES[bot_id]
+    name = bot_name or BOT_NAMES[bot_id]
     log = logging.getLogger(f"bot.{name}")
 
     cmd_count = 0
@@ -369,7 +391,90 @@ async def bot_worker(
         await conn.close()
 
 
-async def main(address: str, num_bots: int, *, reset: bool = False, no_road: bool = False, no_building: bool = False, only_road: bool = False, only_building: bool = False, only_centerline: bool = False) -> None:
+async def resolve_realms(invite_code: str | None = None) -> tuple[str, str, object, object | None]:
+    """Realms に認証して接続先アドレス、login_chain、auth_key、Network を返す.
+
+    Returns:
+        (address, login_chain, auth_key, multiplayer_token, network)
+    """
+    from pymc.auth.live import get_live_token
+    from pymc.auth.xbox import request_xbl_token
+    from pymc.auth.minecraft import request_minecraft_chain
+    from pymc.realms import RealmsClient
+
+    live_token = await get_live_token()
+
+    # Realms API 用トークン
+    xbl_realms = await request_xbl_token(
+        live_token, "https://pocket.realms.minecraft.net/",
+    )
+
+    # Realm アドレス取得
+    async with RealmsClient(xbl_realms) as client:
+        if invite_code:
+            realm = await client.realm(invite_code)
+        else:
+            realms = await client.realms()
+            if not realms:
+                raise RuntimeError("アクセス可能な Realm がありません")
+            realm = realms[0]
+        logger.info("Realm: %s (%s)", realm.name, realm.state)
+        realm_addr = await realm.address()
+        address = realm_addr.address
+
+    network = None
+    multiplayer_token = ""
+    is_nethernet = realm_addr.network_protocol and "NETHERNET" in realm_addr.network_protocol.upper()
+    is_jsonrpc = is_nethernet and "JSONRPC" in realm_addr.network_protocol.upper()
+
+    # 認証キー生成（login chain と multiplayer token で共有）
+    key = ec.generate_private_key(ec.SECP384R1())
+
+    if is_nethernet:
+        logger.info("NetherNet プロトコル検出: MCToken を取得中...")
+        from pymc.auth.service import discover, request_service_token, request_multiplayer_token
+        from pymc.nethernet.network import NetherNetNetwork
+
+        # XBL トークン (PlayFab relying party) — PlayFab を経由せず直接使用
+        xbl_pf = await request_xbl_token(live_token, "rp://playfabapi.com/")
+
+        # Discovery (環境自動解決) + MCToken + signaling info
+        discovery = await discover()
+        service_token = await request_service_token(
+            discovery.auth_uri,
+            xbl_pf.auth_header_value(),
+            playfab_title_id=discovery.playfab_title_id,
+        )
+        signaling_info = discovery.signaling_info
+        logger.info("MCToken 取得完了")
+        logger.info("シグナリング: %s", signaling_info.service_uri)
+
+        # Multiplayer token (OIDC JWT) — Login パケットの Token フィールドに必要
+        multiplayer_token = await request_multiplayer_token(
+            discovery.auth_uri,
+            service_token,
+            key.public_key(),
+        )
+        logger.info("Multiplayer token 取得完了")
+
+        # NetherNet ネットワーク (ランダム network_id)
+        network = NetherNetNetwork(
+            mc_token=service_token.authorization_header,
+            signaling_url=signaling_info.service_uri,
+            use_jsonrpc=is_jsonrpc,
+        )
+
+    # Minecraft 認証用トークン（login chain 取得）
+    xbl_mp = await request_xbl_token(
+        live_token, "https://multiplayer.minecraft.net/",
+    )
+    login_chain = await request_minecraft_chain(xbl_mp, key)
+
+    logger.info("Realm アドレス: %s (プロトコル: %s)", address, realm_addr.network_protocol)
+    return address, login_chain, key, multiplayer_token, network
+
+
+async def main(address: str, num_bots: int, *, reset: bool = False, no_road: bool = False, no_building: bool = False, only_road: bool = False, only_building: bool = False, only_centerline: bool = False, realms: bool = False, invite_code: str | None = None) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -379,13 +484,30 @@ async def main(address: str, num_bots: int, *, reset: bool = False, no_road: boo
         logger.error("ボット数は 1~26 で指定してください")
         return
 
-    ping_network = RakNetNetwork()
-    try:
-        pong = await ping_network.ping(address)
-        logger.info("サーバー発見: %s", pong.decode()[:80])
-    except Exception as e:
-        logger.error("サーバー応答なし: %s", e)
-        return
+    login_chain = None
+    auth_key = None
+    multiplayer_token = ""
+    realms_network = None
+    realms_gamertag = None
+    if realms:
+        num_bots = 1
+        logger.info("Realms モード: 認証中...")
+        address, login_chain, auth_key, multiplayer_token, realms_network = await resolve_realms(invite_code)
+        realms_gamertag = extract_gamertag(login_chain)
+        if realms_gamertag:
+            logger.info("ゲーマータグ: %s", realms_gamertag)
+
+    if realms_network is None:
+        # RakNet: ping で接続確認
+        ping_network = RakNetNetwork()
+        try:
+            pong = await ping_network.ping(address)
+            logger.info("サーバー発見: %s", pong.decode()[:80])
+        except Exception as e:
+            logger.error("サーバー応答なし: %s", e)
+            return
+    else:
+        logger.info("NetherNet 接続: ping スキップ")
 
     heightmap, buildingmap, surfacemap, bridgemap, centerlinemap, roadcatmap, x_offset, z_offset = load_terrain(TERRAIN_JSON, HEIGHTMAP_CSV)
     size_z = len(heightmap)
@@ -470,15 +592,18 @@ async def main(address: str, num_bots: int, *, reset: bool = False, no_road: boo
         for i, z in enumerate(remaining):
             chunks[i % actual_bots].append(z)
 
-        bot_names = [BOT_NAMES[i] for i in range(actual_bots)]
+        if realms_gamertag:
+            bot_names = [realms_gamertag]
+        else:
+            bot_names = [BOT_NAMES[i] for i in range(actual_bots)]
         logger.info("ボット %d 体: %s", actual_bots, ", ".join(bot_names))
 
         # ボットを1体ずつ順次接続
         connections = []
         read_tasks = []
         for i in range(actual_bots):
-            logger.info("接続中: %s (%d/%d)...", BOT_NAMES[i], i + 1, actual_bots)
-            conn = await connect_bot(i, address)
+            logger.info("接続中: %s (%d/%d)...", bot_names[i], i + 1, actual_bots)
+            conn = await connect_bot(i, address, login_chain=login_chain, auth_key=auth_key, multiplayer_token=multiplayer_token, network=realms_network)
             read_task = start_read_task(conn)
             connections.append(conn)
             read_tasks.append(read_task)
@@ -512,7 +637,8 @@ async def main(address: str, num_bots: int, *, reset: bool = False, no_road: boo
             *(bot_worker(i, connections[i], read_tasks[i], heightmap, buildingmap,
                          surfacemap, bridgemap, centerlinemap, roadcatmap,
                          chunks[i], phase_name, progress_file,
-                         stats, x_offset, z_offset)
+                         stats, x_offset, z_offset,
+                         bot_name=bot_names[i] if i < len(bot_names) else None)
               for i in range(actual_bots))
         )
 
@@ -540,5 +666,7 @@ if __name__ == "__main__":
     parser.add_argument("--only-road", action="store_true", help="道路・橋配置のみ実行する")
     parser.add_argument("--only-building", action="store_true", help="建物配置のみ実行する")
     parser.add_argument("--only-centerline", action="store_true", help="レッドストーン配置のみ実行する")
+    parser.add_argument("--realms", action="store_true", help="Realms に接続する（1ボット、Xbox Live 認証）")
+    parser.add_argument("--invite-code", default=None, help="Realm の招待コード（省略時は最初の Realm）")
     args = parser.parse_args()
-    asyncio.run(main(args.address, args.bots, reset=args.reset, no_road=args.no_road, no_building=args.no_building, only_road=args.only_road, only_building=args.only_building, only_centerline=args.only_centerline))
+    asyncio.run(main(args.address, args.bots, reset=args.reset, no_road=args.no_road, no_building=args.no_building, only_road=args.only_road, only_building=args.only_building, only_centerline=args.only_centerline, realms=args.realms, invite_code=args.invite_code))

@@ -192,7 +192,8 @@ async def request_device_token(
         ) as resp:
             update_server_time(dict(resp.headers))
             if resp.status != 200:
-                raise RuntimeError(f"device auth failed: {resp.status}")
+                err_body = await resp.text()
+                raise RuntimeError(f"device auth failed: {resp.status} {err_body}")
             data = await resp.json(content_type=None)
             return _DeviceToken(
                 token=data["Token"],
