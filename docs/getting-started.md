@@ -1,5 +1,64 @@
 # はじめに
 
+## mcbe でできること
+
+```mermaid
+graph TB
+    subgraph mcbe["🎮 mcbe (Python)"]
+        auth["認証\nXbox Live / PlayFab"]
+        dial["クライアント接続\nDialer"]
+        listen["サーバー起動\nListener"]
+        proxy["MITM プロキシ"]
+        proto["パケット読み書き\n210+ パケット対応"]
+    end
+
+    subgraph transport["トランスポート"]
+        raknet["RakNet\nUDP"]
+        nethernet["NetherNet\nWebRTC DataChannel"]
+    end
+
+    subgraph backends["WebRTC バックエンド"]
+        ldc["libdatachannel\nC++ ネイティブ（推奨）"]
+        aiortc["aiortc\nPure Python"]
+    end
+
+    subgraph targets["接続先"]
+        bds["BDS\nDedicated Server"]
+        lan["LAN ワールド"]
+        realms["Realms"]
+    end
+
+    subgraph usecases["活用例"]
+        block["ブロック配置"]
+        terrain["地形データ配置\n複数ボット並列"]
+        bot["Bot 自動化"]
+        analysis["パケット解析"]
+    end
+
+    auth --> dial
+    dial --> raknet
+    dial --> nethernet
+    listen --> raknet
+    proxy --> raknet
+
+    nethernet --> ldc
+    nethernet --> aiortc
+
+    raknet --> bds
+    raknet --> lan
+    nethernet --> realms
+
+    proto --> usecases
+    dial --> proto
+    listen --> proto
+
+    style mcbe fill:#1a1a2e,stroke:#e94560,color:#eee
+    style transport fill:#16213e,stroke:#0f3460,color:#eee
+    style backends fill:#1a1a2e,stroke:#533483,color:#eee
+    style targets fill:#0f3460,stroke:#e94560,color:#eee
+    style usecases fill:#16213e,stroke:#533483,color:#eee
+```
+
 ## インストール
 
 ### 基本インストール
