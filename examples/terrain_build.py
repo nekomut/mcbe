@@ -13,7 +13,7 @@ BDS に直接接続し、基盤地図情報 DEM5A から生成した地形を配
   - MC座標: X+=東, Z+=南, Y+=上
 
 Usage:
-    python examples/place_block.py --address 127.0.0.1:19132 --bots 4
+    python examples/terrain_build.py --address 127.0.0.1:19132 --bots 4
 """
 
 from __future__ import annotations

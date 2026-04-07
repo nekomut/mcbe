@@ -1,7 +1,7 @@
 # 道路ベクトルタイル仕様メモ
 
 地理院ベクトルタイル `experimental_bvmap` の道路関連情報。
-gen_terrain.py での道路・橋判定の設計資料。
+terrain_gen.py での道路・橋判定の設計資料。
 
 ## タイル URL
 
@@ -15,7 +15,7 @@ https://cyberjapandata.gsi.go.jp/xyz/experimental_bvmap/{z}/{x}/{y}.pbf
 
 ftCode の構造: `27` + 種別(0-3) + 状態(1-4)
 
-| ftCode | 種別     | 状態     | 提供 ZL | gen_terrain.py での扱い            |
+| ftCode | 種別     | 状態     | 提供 ZL | terrain_gen.py での扱い            |
 |--------|----------|----------|--------:|------------------------------------|
 | 2701   | 通常道路 | 通常部   |  z8–16 | marker_270x + all_road_lines       |
 | 2702   | 通常道路 | 雪覆い   | z14–16 | — (未使用)                        |
@@ -36,7 +36,7 @@ ftCode の構造: `27` + 種別(0-3) + 状態(1-4)
 
 ### 道路中心線（22xx）— LineString / MultiLineString
 
-| ftCode | 意味                         | 提供 ZL | gen_terrain.py での扱い       |
+| ftCode | 意味                         | 提供 ZL | terrain_gen.py での扱い       |
 |-------:|------------------------------|--------:|-------------------------------|
 |   2201 | 道路中心線・通常部           |     z16 | edge_22xx + all_road_lines    |
 |   2203 | 道路中心線・橋・高架         |     z16 | edge_22xx + all_road_lines    |
@@ -45,7 +45,7 @@ ftCode の構造: `27` + 種別(0-3) + 状態(1-4)
 
 ### その他の道路線（24xx）— LineString / MultiLineString
 
-| ftCode | 意味     | 提供 ZL | gen_terrain.py での扱い    |
+| ftCode | 意味     | 提供 ZL | terrain_gen.py での扱い    |
 |-------:|----------|--------:|----------------------------|
 |   2411 | 庭園路等 |     z16 | edge_22xx + all_road_lines |
 
@@ -79,7 +79,7 @@ z=14–16 で取得できる属性:
 
 ## 関連レイヤー
 
-| レイヤー  | ジオメトリ | gen_terrain.py での扱い       |
+| レイヤー  | ジオメトリ | terrain_gen.py での扱い       |
 |-----------|------------|-------------------------------|
 | waterarea | Polygon    | 水域マスク (SURFACE_WATER)    |
 | building  | Polygon    | 建物マスク (buildingmap)      |
@@ -156,14 +156,14 @@ surface[road_filled & ~water_mask] = SURFACE_ROAD
 
 ## --debug レッドストーン配置
 
-gen_terrain.py に `--debug` を指定すると `centerlinemap` が terrain.json に出力される。
-place_block.py はこれを読み込み、橋フェーズの後に独立した「centerline」フェーズで
+terrain_gen.py に `--debug` を指定すると `centerlinemap` が terrain.json に出力される。
+terrain_build.py はこれを読み込み、橋フェーズの後に独立した「centerline」フェーズで
 デバッグブロックを配置する。
 
 ### データの流れ
 
 ```
-gen_terrain.py --debug
+terrain_gen.py --debug
   1. dbg_edge_22xx に 22xx/24xx をラスタライズ（バリア）
   2. dbg_marker_270x に 270x をラスタライズ（道路側マーカー、細い道除外）
   3. ndimage_label(~dbg_edge_22xx) → 22xx で区切られた領域をラベリング
@@ -174,7 +174,7 @@ gen_terrain.py --debug
   6. ftCode 別ブロック値でライン描画（背景を上書き）
   → centerlinemap (int8) として JSON 出力
 
-place_block.py
+terrain_build.py
   → terrain → road → building → centerline の順にフェーズ実行
   → terrain: 草地・水域を配置（道路セルも草地として配置）
   → road: 道路（andesite+dirt）・橋（andesite）を上書き配置
@@ -207,7 +207,7 @@ place_block.py
 | 7  | lit_pumpkin           | 222x            | 道路中心線亜種 |
 | 8  | sea_lantern           | 24xx            | トンネル内道路 |
 
-### place_block.py での配置ロジック
+### terrain_build.py での配置ロジック
 
 - 橋面がある (`bridgemap[z][x] > 0`): 橋面高さの最上面にブロック配置
 - それ以外: 地形高さ (`heightmap`) の最上面にブロック配置
@@ -335,7 +335,7 @@ ZL17 の 22xx は annoCtg で詳細分類される。
 - 2702, 2712, 2722, 2732（雪覆い）— 通常部と同じ扱いで良い
 - 2713, 2733（庭園路・石段の橋）— 現在は道路判定に含めていない
 
-## place_block.py コマンドラインオプション
+## terrain_build.py コマンドラインオプション
 
 | オプション          | 説明                               |
 |---------------------|------------------------------------|
@@ -346,7 +346,7 @@ ZL17 の 22xx は annoCtg で詳細分類される。
 | `--only-building`   | 建物配置のみ実行する               |
 | `--only-centerline` | レッドストーン配置のみ実行する     |
 
-## gen_terrain.py コマンドラインオプション
+## terrain_gen.py コマンドラインオプション
 
 | オプション  | 説明                                     |
 |-------------|------------------------------------------|
@@ -368,9 +368,9 @@ ZL17 の 22xx は annoCtg で詳細分類される。
 
 | キー      | 型    | 参照元         | 説明                                             |
 |-----------|-------|----------------|--------------------------------------------------|
-| `address` | str   | place_block.py | BDS サーバーアドレス（`--address` のデフォルト） |
-| `lat`     | float | gen_terrain.py | 中心緯度（`--lat` のデフォルト、省略可能に）     |
-| `lon`     | float | gen_terrain.py | 中心経度（`--lon` のデフォルト、省略可能に）     |
+| `address` | str   | terrain_build.py | BDS サーバーアドレス（`--address` のデフォルト） |
+| `lat`     | float | terrain_gen.py | 中心緯度（`--lat` のデフォルト、省略可能に）     |
+| `lon`     | float | terrain_gen.py | 中心経度（`--lon` のデフォルト、省略可能に）     |
 
 ## 道路・橋の高さ補間
 
@@ -391,7 +391,7 @@ DEM cubic spline 補間
 橋面高さを bridgemap に記録、地形用に元の標高を復元
 ```
 
-### place_block.py でのブロック配置
+### terrain_build.py でのブロック配置
 
 道路・橋ブロック:
 - 主要道路（rdCtg 0,1,3）: 最上面=gray_concrete_powder, その下=stone, 3~4=dirt, 5以下=stone

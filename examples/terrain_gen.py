@@ -2,11 +2,11 @@
 
 DEM5A 標高タイル（txt）+ ベクトルタイル（pbf）から terrain.json を出力。
 GML ファイル不要。緯度経度を指定するだけで任意の場所の地形を生成できる。
-出力は place_block.py と互換。
+出力は terrain_build.py と互換。
 
 Usage:
-    python examples/gen_terrain.py --lat 36.104665 --lon 140.087099
-    python examples/gen_terrain.py --lat 35.6895 --lon 139.6917 --width 500 --height 500
+    python examples/terrain_gen.py --lat 36.104665 --lon 140.087099
+    python examples/terrain_gen.py --lat 35.6895 --lon 139.6917 --width 500 --height 500
 """
 
 from __future__ import annotations
