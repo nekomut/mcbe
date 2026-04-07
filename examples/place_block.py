@@ -119,6 +119,7 @@ async def main(
             command_line=cmd,
             command_origin=CommandOrigin(origin=ORIGIN_PLAYER),
             internal=False,
+            version="latest",
         ))
         await conn.flush()
         logger.info("実行: %s", cmd)

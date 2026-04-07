@@ -51,7 +51,7 @@ class CommandRequest(Packet):
     command_line: str = ""
     command_origin: CommandOrigin = field(default_factory=CommandOrigin)
     internal: bool = False
-    version: str = ""
+    version: str = "latest"
 
     def write(self, w: PacketWriter) -> None:
         w.string(self.command_line)
