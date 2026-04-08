@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mcbe.proto.io import PacketReader, PacketWriter
 from mcbe.proto.packet import ID_POSITION_TRACKING_DB_SERVER_BROADCAST
@@ -15,14 +15,17 @@ class PositionTrackingDBServerBroadcast(Packet):
     packet_id = ID_POSITION_TRACKING_DB_SERVER_BROADCAST
     broadcast_action: int = 0
     tracking_id: int = 0
+    payload: dict = field(default_factory=dict)
 
     def write(self, w: PacketWriter) -> None:
         w.uint8(self.broadcast_action)
         w.varint32(self.tracking_id)
+        w.nbt(self.payload)
 
     @classmethod
     def read(cls, r: PacketReader) -> PositionTrackingDBServerBroadcast:
         return cls(
             broadcast_action=r.uint8(),
             tracking_id=r.varint32(),
+            payload=r.nbt(),
         )

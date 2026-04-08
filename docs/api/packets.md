@@ -50,6 +50,7 @@
 | 13 | `ID_ADD_ACTOR` | アクター（エンティティ）追加 |
 | 14 | `ID_REMOVE_ACTOR` | アクター削除 |
 | 15 | `ID_ADD_ITEM_ACTOR` | アイテムエンティティ追加 |
+| 16 | `ID_SERVER_PLAYER_POST_MOVE_POSITION` | プレイヤー移動後位置 |
 | 17 | `ID_TAKE_ITEM_ACTOR` | アイテム取得 |
 | 22 | `ID_ADD_PAINTING` | 絵画追加 |
 | 39 | `ID_SET_ACTOR_DATA` | アクターデータ設定 |

@@ -30,7 +30,7 @@
     │  pool.py     パケットレジストリ + Encoder  │
     │  encryption.py  AES-256-CTR 暗号化        │
     │  login/      IdentityData, ClientData, JWT│
-    │  packet/     210+ パケット定義             │
+    │  packet/     212 パケット定義               │
     └──────────────────────────────────────────┘
 
     ┌──────────┐  ┌──────────┐  ┌──────────┐

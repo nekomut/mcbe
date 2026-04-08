@@ -15,13 +15,15 @@ from mcbe.proto.types import BlockPos
 class SetSpawnPosition(Packet):
     packet_id = ID_SET_SPAWN_POSITION
     spawn_type: int = 0
-    position: BlockPos = 0
+    position: BlockPos = field(default_factory=BlockPos)
     dimension: int = 0
+    spawn_position: BlockPos = field(default_factory=BlockPos)
 
     def write(self, w: PacketWriter) -> None:
         w.varint32(self.spawn_type)
         w.block_pos(self.position)
         w.varint32(self.dimension)
+        w.block_pos(self.spawn_position)
 
     @classmethod
     def read(cls, r: PacketReader) -> SetSpawnPosition:
@@ -29,4 +31,5 @@ class SetSpawnPosition(Packet):
             spawn_type=r.varint32(),
             position=r.block_pos(),
             dimension=r.varint32(),
+            spawn_position=r.block_pos(),
         )

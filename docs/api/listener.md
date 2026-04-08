@@ -17,7 +17,7 @@ ListenConfig(
     compression_threshold: int = 256,
     flush_rate: float = 0.05,
     server_name: str = "mcbe Server",
-    game_version: str = "1.21.50",
+    game_version: str = "1.26.10",
 )
 ```
 
@@ -29,7 +29,7 @@ ListenConfig(
 | `compression_threshold` | `int` | `256` | 圧縮を適用する最小バイト数 |
 | `flush_rate` | `float` | `0.05` | パケットフラッシュ間隔（秒） |
 | `server_name` | `str` | `"mcbe Server"` | サーバー名 |
-| `game_version` | `str` | `"1.21.50"` | ゲームバージョン文字列 |
+| `game_version` | `str` | `"1.26.10"` | ゲームバージョン文字列 |
 
 ---
 
@@ -110,6 +110,7 @@ async def close() -> None
 5. **ClientToServerHandshake** 受信
 6. **PlayStatus (LoginSuccess)** 送信
 7. **リソースパック交換** — ResourcePacksInfo / ResourcePackStack
+8. **ResourcePacksReadyForValidation** 受信 — クライアントのパック検証完了を確認
 
 ---
 
