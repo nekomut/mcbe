@@ -31,6 +31,41 @@ from mcbe.network import Network, NetworkConnection
 logger = logging.getLogger(__name__)
 
 
+def _prefer_tcp_turn(urls: list[str]) -> list[str]:
+    """Rewrite TURN URLs to prefer TLS/TCP transport.
+
+    Microsoft TURN servers (``relay.communication.microsoft.com``) often reject
+    or drop UDP ALLOCATE requests.  aioice does not automatically fall back, so
+    we synthesise ``turns:host:443?transport=tcp`` (TLS) from bare ``turn:``
+    URLs and place them first.  aiortc only uses the **first** TURN server it
+    encounters, so ordering matters.
+
+    ``turns:`` URLs already present are kept as-is.
+    ``stun:`` URLs are passed through unchanged.
+    """
+    import re
+    out: list[str] = []
+    has_turns = any(u.startswith("turns:") for u in urls)
+
+    for url in urls:
+        if url.startswith("turn:") and not url.startswith("turns:"):
+            # Extract host from turn:host:port or turn:host
+            m = re.match(r"^turn:([^:?]+)", url)
+            if m and not has_turns:
+                host = m.group(1)
+                # Prepend a TURNS (TLS/TCP on 443) variant — most reliable path.
+                out.insert(0, f"turns:{host}:443?transport=tcp")
+                has_turns = True
+            # Also add TCP variant of the original URL.
+            if "?transport=" not in url and "transport=" not in url:
+                out.append(url + "?transport=tcp")
+            else:
+                out.append(url)
+        else:
+            out.append(url)
+    return out
+
+
 class NetherNetNetwork(Network):
     """Network implementation using NetherNet (WebRTC) for Realms connections.
 
@@ -94,11 +129,15 @@ class NetherNetNetwork(Network):
             logger.debug("received %d ICE servers", len(creds.ice_servers))
 
             # Build ICE server configuration.
+            # aiortc/aioice often fails TURN ALLOCATE over UDP against Microsoft
+            # relay servers.  Force TCP transport for TURN URLs so that relay
+            # candidates are generated reliably.
             ice_servers = []
             for server in creds.ice_servers:
-                logger.debug("ICE server: urls=%s", server.urls)
+                urls = _prefer_tcp_turn(server.urls)
+                logger.debug("ICE server: urls=%s", urls)
                 ice_servers.append(RTCIceServer(
-                    urls=server.urls,
+                    urls=urls,
                     username=server.username,
                     credential=server.password,
                 ))
@@ -154,6 +193,29 @@ class NetherNetNetwork(Network):
                     await pc.setRemoteDescription(answer)
                     answer_received = True
                     logger.info("received SDP answer from %s", sig.network_id)
+
+                    # Diagnostic: log ICE internals
+                    try:
+                        for transport in pc._RTCPeerConnection__iceTransports:
+                            ice_conn = transport._connection
+                            logger.info(
+                                "ICE check_list=%d protocols=%d remote_candidates=%d",
+                                len(ice_conn._check_list),
+                                len(ice_conn._protocols),
+                                len(ice_conn._remote_candidates),
+                            )
+                            for i, pair in enumerate(ice_conn._check_list):
+                                logger.info(
+                                    "  pair[%d]: (%s:%d %s) -> (%s:%d %s) state=%s",
+                                    i,
+                                    pair.local_candidate.host, pair.local_candidate.port,
+                                    pair.local_candidate.type,
+                                    pair.remote_candidate.host, pair.remote_candidate.port,
+                                    pair.remote_candidate.type,
+                                    pair.state,
+                                )
+                    except Exception as e:
+                        logger.warning("ICE diagnostic failed: %s", e)
 
                 elif sig.type == SIGNAL_CANDIDATE:
                     # Add remote ICE candidate.

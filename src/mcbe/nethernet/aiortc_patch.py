@@ -6,6 +6,8 @@ Patches applied:
 3. Fix DCEP OPEN ordered flag to match channel configuration (RFC 8832).
 4. Reduce stream counts in new RTCSctpTransport instances.
 5. Add SCTP chunk logging for diagnostics.
+6. Log TURN allocation failures.
+7. Discard unauthenticated STUN error responses (RFC 8489 §9.1.4).
 """
 
 from __future__ import annotations
@@ -97,3 +99,48 @@ def apply():
     sctp.RTCSctpTransport._receive_chunk = _patched_receive_chunk
 
     logger.info("aiortc SCTP patches applied")
+
+    # 6. Log TURN allocation failures (aioice silently swallows them).
+    import aioice.ice as _ice
+    _original_relayed_candidate = _ice.relayed_candidate
+
+    async def _logged_relayed_candidate(*args, **kwargs):
+        try:
+            return await _original_relayed_candidate(*args, **kwargs)
+        except Exception as e:
+            turn_server = kwargs.get("turn_server") or (args[2] if len(args) > 2 else "?")
+            turn_transport = kwargs.get("turn_transport") or (args[6] if len(args) > 6 else "?")
+            logger.warning(
+                "TURN allocation failed (server=%s transport=%s): %s: %s",
+                turn_server, turn_transport, type(e).__name__, e,
+            )
+            raise
+
+    _ice.relayed_candidate = _logged_relayed_candidate
+    logger.info("aiortc TURN logging patch applied")
+
+    # 7. Discard unauthenticated STUN error responses (RFC 8489 §9.1.4).
+    #
+    #    Minecraft BDS (libwebrtc) sends a 401 Unauthorized error WITHOUT
+    #    MESSAGE-INTEGRITY before sending the real success response for the
+    #    same transaction.  Per RFC 8489 §9.1.4, error responses without
+    #    MESSAGE-INTEGRITY MUST be discarded.  aioice does not implement
+    #    this, causing the transaction to fail prematurely.
+    from aioice import stun as _stun
+    _original_response_received = _stun.Transaction.response_received
+
+    def _rfc8489_response_received(self, message, addr):
+        if message.message_class == _stun.Class.ERROR:
+            if "MESSAGE-INTEGRITY" not in message.attributes:
+                logger.debug(
+                    "discarding unauthenticated STUN error from %s "
+                    "(no MESSAGE-INTEGRITY, RFC 8489 §9.1.4): %s",
+                    addr,
+                    message.attributes.get("ERROR-CODE", "?"),
+                )
+                return
+        _original_response_received(self, message, addr)
+
+    _stun.Transaction.response_received = _rfc8489_response_received
+
+    logger.info("aiortc ICE patches applied")
