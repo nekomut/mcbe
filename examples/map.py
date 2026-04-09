@@ -44,12 +44,8 @@ from mcbe.chunk import (
 from mcbe.conn import Connection
 from mcbe.dial import Dialer
 from mcbe.proto.login.data import IdentityData
-from mcbe.proto.packet.command_request import (
-    CommandOrigin,
-    CommandRequest,
-    ORIGIN_AUTOMATION_PLAYER,
-)
 from mcbe.proto.packet.command_output import CommandOutput
+from mcbe.proto.packet.command_request import CommandRequest, CommandOrigin, ORIGIN_AUTOMATION_PLAYER
 from mcbe.proto.packet.level_chunk import (
     LevelChunk,
     SUB_CHUNK_REQUEST_MODE_LIMITED,
@@ -66,6 +62,9 @@ logger = logging.getLogger(__name__)
 EXAMPLES_DIR = Path(__file__).parent
 HTML_PATH = EXAMPLES_DIR / "map.html"
 CACHE_DIR = EXAMPLES_DIR / ".map_cache"
+
+MAP_RANGE_CHUNKS = 8   # ±8 chunks from center (for chunk refresh)
+MAP_CLIP_BLOCKS = 200  # clip display to 200×200 blocks
 
 def _build_hash_table_from_names(block_names: list[str]) -> dict[int, str]:
     """Build hash → block name table from a list of block names (empty states)."""
@@ -646,6 +645,8 @@ class MapState:
     world_name: str = ""
     world_seed: int = 0
     dirty_chunks: set[tuple[int, int]] = field(default_factory=set)
+    refresh_needed: bool = False
+    teleport_request: tuple[int, int] | None = None
     cache_dir: Path | None = None
 
     def save_chunk(self, cx: int, cz: int) -> None:
@@ -777,9 +778,10 @@ class MapDialer(Dialer):
                         len(canonical), len(pk.blocks), len(state.hash_table),
                     )
 
-                logger.info("StartGame: world=%s blocks=%d entity_id=%d hashes=%s",
+                logger.info("StartGame: world=%s blocks=%d entity_id=%d hashes=%s pos=(%.1f,%.1f,%.1f)",
                             pk.world_name, len(state.block_palette),
-                            pk.entity_runtime_id, pk.use_block_network_id_hashes)
+                            pk.entity_runtime_id, pk.use_block_network_id_hashes,
+                            pk.player_position.x, pk.player_position.y, pk.player_position.z)
 
                 # Setup cache directory.
                 safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in pk.world_name)
@@ -969,22 +971,39 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     state: MapState = request.app["state"]
     ws_clients.add(ws)
     logger.info("WebSocket クライアント接続 (合計 %d)", len(ws_clients))
+    state.refresh_needed = True
 
     # Send init with all cached chunks.
     try:
         chunks_data = _build_all_chunks(state)
         players_data = _build_players(state)
+        center_cx, center_cz = _get_map_center(state)
+        bot = state.players.get(state.bot_entity_id)
         await ws.send_str(json.dumps({
             "type": "init",
+            "botName": bot.name if bot else None,
             "players": players_data,
             "chunks": chunks_data,
+            "clip": {
+                "minX": center_cx * 16 - MAP_CLIP_BLOCKS // 2,
+                "minZ": center_cz * 16 - MAP_CLIP_BLOCKS // 2,
+                "maxX": center_cx * 16 + MAP_CLIP_BLOCKS // 2,
+                "maxZ": center_cz * 16 + MAP_CLIP_BLOCKS // 2,
+            },
         }))
     except Exception as e:
         logger.warning("init send error: %s", e)
 
     try:
         async for msg in ws:
-            pass  # No client messages expected.
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    if data.get("type") == "teleport":
+                        state.teleport_request = (int(data["x"]), int(data["z"]))
+                        logger.info("テレポート要求: (%d, %d)", data["x"], data["z"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
     except Exception:
         pass
     finally:
@@ -1004,6 +1023,14 @@ def _build_chunk_data(cx: int, cz: int, top_blocks: list[str]) -> dict:
         "palette": palette_set,
         "data": base64.b64encode(grid).decode(),
     }
+
+
+def _get_map_center(state: MapState) -> tuple[int, int]:
+    """Return center chunk coordinates based on bot position."""
+    bot = state.players.get(state.bot_entity_id)
+    if bot:
+        return int(bot.x // 16), int(bot.z // 16)
+    return 0, 0
 
 
 def _build_all_chunks(state: MapState) -> list[dict]:
@@ -1036,10 +1063,17 @@ async def ws_broadcast_loop(state: MapState, ws_clients: set[web.WebSocketRespon
             if top_blocks:
                 chunks_data.append(_build_chunk_data(cx, cz, top_blocks))
 
+        center_cx, center_cz = _get_map_center(state)
         msg = json.dumps({
             "type": "update",
             "players": _build_players(state),
             "chunks": chunks_data,
+            "clip": {
+                "minX": center_cx * 16 - MAP_CLIP_BLOCKS // 2,
+                "minZ": center_cz * 16 - MAP_CLIP_BLOCKS // 2,
+                "maxX": center_cx * 16 + MAP_CLIP_BLOCKS // 2,
+                "maxZ": center_cz * 16 + MAP_CLIP_BLOCKS // 2,
+            },
         })
 
         dead: set[web.WebSocketResponse] = set()
@@ -1170,99 +1204,45 @@ async def _recv_loop(conn: Connection, state: MapState) -> None:
                     z=pk.position.z, yaw=pk.yaw,
                 )
         elif isinstance(pk, CommandOutput):
-            # querytarget response handling.
-            if pk.data_set:
-                _handle_querytarget(pk.data_set, state)
+            pass
 
 
 async def _teleport_loop(conn: Connection, state: MapState) -> None:
-    """Periodically query player positions and teleport to cover all areas."""
+    """Periodically handle refresh requests and update bot position."""
     await asyncio.sleep(3.0)  # Wait for initial chunks.
 
-    last_tp_target: tuple[float, float] | None = None
-
     while not conn.closed:
-        # Collect other players' positions (exclude bot).
-        other_players = [
-            p for eid, p in state.players.items()
-            if eid != state.bot_entity_id and p.name != "bot"
-        ]
 
-        if other_players:
-            # Teleport to the first non-bot player's position.
-            target = other_players[0]
-            tp_x, tp_z = target.x, target.z
-        else:
-            # No other players — default to (0, 0).
-            tp_x, tp_z = 0.0, 0.0
-
-        # Only teleport if target changed significantly.
-        if last_tp_target is None or (
-            abs(tp_x - last_tp_target[0]) > 16 or abs(tp_z - last_tp_target[1]) > 16
-        ):
-            try:
-                await conn.write_packet(CommandRequest(
-                    command_line=f"/tp @s {tp_x:.0f} 320 {tp_z:.0f}",
-                    command_origin=CommandOrigin(
-                        origin=ORIGIN_AUTOMATION_PLAYER,
-                        request_id=str(_uuid.uuid4()),
-                    ),
-                    internal=False,
-                ))
-                await conn.flush()
-                last_tp_target = (tp_x, tp_z)
-            except Exception:
-                break
-
-        # Query all player positions.
-        try:
+        # Handle teleport request from browser.
+        tp = state.teleport_request
+        if tp is not None:
+            state.teleport_request = None
+            x, z = tp
+            cmd = f"/tp @s {x} 200 {z}"
+            logger.info("テレポート実行: %s", cmd)
             await conn.write_packet(CommandRequest(
-                command_line="/querytarget @a",
+                command_line=cmd,
                 command_origin=CommandOrigin(
                     origin=ORIGIN_AUTOMATION_PLAYER,
-                    request_id=str(_uuid.uuid4()),
+                    uuid=_uuid.uuid4(),
+                    request_id="map-tp",
                 ),
-                internal=False,
             ))
-            await conn.flush()
-        except Exception:
-            break
 
-        await asyncio.sleep(5.0)
+        # Handle refresh request (browser reload).
+        if state.refresh_needed:
+            state.refresh_needed = False
+            center_cx, center_cz = _get_map_center(state)
+            count = 0
+            for cx in range(center_cx - MAP_RANGE_CHUNKS, center_cx + MAP_RANGE_CHUNKS):
+                for cz in range(center_cz - MAP_RANGE_CHUNKS, center_cz + MAP_RANGE_CHUNKS):
+                    if (cx, cz) in state.chunk_top_y:
+                        state.chunk_top_y[(cx, cz)] = [-9999] * 256
+                        count += 1
+            if count:
+                logger.info("リフレッシュ: %d チャンクの高さマップをリセット", count)
 
-
-def _handle_querytarget(data_set: str, state: MapState) -> None:
-    """Parse /querytarget response and update player positions."""
-    try:
-        results = json.loads(data_set)
-        if not isinstance(results, list):
-            return
-        for entry in results:
-            if not isinstance(entry, dict):
-                continue
-            pos = entry.get("position")
-            name = entry.get("uniqueId", "")
-            if pos and isinstance(pos, dict):
-                # Store by name as a simple player ID.
-                found = False
-                for p in state.players.values():
-                    if p.name == name:
-                        p.x = float(pos.get("x", 0))
-                        p.y = float(pos.get("y", 0))
-                        p.z = float(pos.get("z", 0))
-                        found = True
-                        break
-                if not found:
-                    # Add as new player (use hash of name as fake entity ID).
-                    eid = hash(name) & 0xFFFFFFFF
-                    state.players[eid] = PlayerInfo(
-                        name=name,
-                        x=float(pos.get("x", 0)),
-                        y=float(pos.get("y", 0)),
-                        z=float(pos.get("z", 0)),
-                    )
-    except (json.JSONDecodeError, ValueError):
-        pass
+        await asyncio.sleep(1.0)
 
 
 # ── proxy モード ─────────────────────────────────────────────────

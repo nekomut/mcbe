@@ -158,5 +158,5 @@ asyncio.run(main())
 | `examples/proxy.py` | MITM プロキシ |
 | `examples/terrain_gen.py` | 地形データ生成 |
 | `examples/terrain_build.py` | 生成した地形データの配置 (複数ボット並列) |
-| `examples/map.py` | リアルタイムマップビューア (テクスチャアトラス + WebSocket) |
+| `examples/map.py` | リアルタイムマップビューア (テクスチャアトラス + ブラウザからテレポート操作) |
 | `examples/diagnose.py` | ネットワーク診断 |

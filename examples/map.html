@@ -55,6 +55,7 @@ let blockColors = {};        // "minecraft:stone" -> [r,g,b] | null
 let chunkCache = new Map();  // "cx,cz" -> { palette, data(Uint8Array), canvas }
 let players = [];
 let totalChunks = 0;
+let clipRect = null;  // {minX, minZ, maxX, maxZ} in world blocks
 
 // Texture atlas
 let atlasImage = null;
@@ -69,7 +70,9 @@ const MIN_ZOOM = 0.5, MAX_ZOOM = 32;
 
 // Interaction
 let dragging = false, dragStartX = 0, dragStartY = 0, dragCamX = 0, dragCamZ = 0;
-let followPlayer = null;
+let botName = null;        // always follow bot
+let camOffsetX = 0, camOffsetZ = 0;  // user drag offset from bot
+let pendingTeleport = null; // {x, z} waiting for bot to arrive
 
 // --- Coordinate conversion ---
 // MC: X+ = east, Z+ = south.  Screen: right = east, down = south (Z+).
@@ -173,10 +176,22 @@ function draw() {
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
 
-  // Follow player
-  if (followPlayer) {
-    const p = players.find(p => p.name === followPlayer);
-    if (p) { camX = p.x; camZ = p.z; }
+  // Always follow bot
+  if (botName) {
+    const p = players.find(p => p.name === botName);
+    if (p) {
+      // Clear offset when bot arrives at teleport destination
+      if (pendingTeleport) {
+        const dx = p.x - pendingTeleport.x, dz = p.z - pendingTeleport.z;
+        if (dx * dx + dz * dz < 256) { // within 16 blocks
+          camOffsetX = 0; camOffsetZ = 0;
+          pendingTeleport = null;
+        }
+      }
+      camX = p.x + camOffsetX; camZ = p.z + camOffsetZ;
+    }
+  } else {
+    camX = camOffsetX; camZ = camOffsetZ;
   }
 
   const chunkPx = 16 * zoom;
@@ -225,7 +240,7 @@ function draw() {
   for (const p of players) {
     const [px, py] = worldToScreen(p.x, p.z);
     if (px < -50 || px > w + 50 || py < -50 || py > h + 50) continue;
-    drawPlayerMarker(px, py, p.yaw, p.name, p.name === followPlayer);
+    drawPlayerMarker(px, py, p.yaw, p.name, p.name === botName);
   }
 
   // HUD
@@ -276,22 +291,31 @@ canvas.addEventListener("mousedown", e => {
   if (e.button === 0) {
     dragging = true;
     dragStartX = e.clientX; dragStartY = e.clientY;
-    dragCamX = camX; dragCamZ = camZ;
-    followPlayer = null;  // Stop following on drag
+    dragCamX = camOffsetX; dragCamZ = camOffsetZ;
   }
 });
 
 window.addEventListener("mousemove", e => {
   lastMouseX = e.clientX; lastMouseY = e.clientY;
   if (dragging) {
-    camX = dragCamX - (e.clientX - dragStartX) / zoom;
-    camZ = dragCamZ - (e.clientY - dragStartY) / zoom;
+    camOffsetX = dragCamX - (e.clientX - dragStartX) / zoom;
+    camOffsetZ = dragCamZ - (e.clientY - dragStartY) / zoom;
   }
   updateTooltip(e.clientX, e.clientY);
   requestDraw();
 });
 
-window.addEventListener("mouseup", () => { dragging = false; });
+window.addEventListener("mouseup", () => {
+  if (dragging && (camOffsetX !== 0 || camOffsetZ !== 0)) {
+    // Teleport bot to new center
+    const [wx, wz] = screenToWorld(canvas.width / 2, canvas.height / 2);
+    if (wsConn && wsConn.readyState === WebSocket.OPEN) {
+      wsConn.send(JSON.stringify({ type: "teleport", x: Math.floor(wx), z: Math.floor(wz) }));
+      pendingTeleport = { x: Math.floor(wx), z: Math.floor(wz) };
+    }
+  }
+  dragging = false;
+});
 
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
@@ -314,8 +338,7 @@ canvas.addEventListener("touchstart", e => {
   if (e.touches.length === 1) {
     dragging = true;
     dragStartX = e.touches[0].clientX; dragStartY = e.touches[0].clientY;
-    dragCamX = camX; dragCamZ = camZ;
-    followPlayer = null;
+    dragCamX = camOffsetX; dragCamZ = camOffsetZ;
   } else if (e.touches.length === 2) {
     dragging = false;
     lastTouchDist = Math.hypot(
@@ -328,8 +351,8 @@ canvas.addEventListener("touchstart", e => {
 
 canvas.addEventListener("touchmove", e => {
   if (e.touches.length === 1 && dragging) {
-    camX = dragCamX - (e.touches[0].clientX - dragStartX) / zoom;
-    camZ = dragCamZ - (e.touches[0].clientY - dragStartY) / zoom;
+    camOffsetX = dragCamX - (e.touches[0].clientX - dragStartX) / zoom;
+    camOffsetZ = dragCamZ - (e.touches[0].clientY - dragStartY) / zoom;
     requestDraw();
   } else if (e.touches.length === 2) {
     const dist = Math.hypot(
@@ -345,7 +368,16 @@ canvas.addEventListener("touchmove", e => {
   e.preventDefault();
 }, { passive: false });
 
-canvas.addEventListener("touchend", () => { dragging = false; lastTouchDist = 0; });
+canvas.addEventListener("touchend", () => {
+  if (dragging && (camOffsetX !== 0 || camOffsetZ !== 0)) {
+    const [wx, wz] = screenToWorld(canvas.width / 2, canvas.height / 2);
+    if (wsConn && wsConn.readyState === WebSocket.OPEN) {
+      wsConn.send(JSON.stringify({ type: "teleport", x: Math.floor(wx), z: Math.floor(wz) }));
+      pendingTeleport = { x: Math.floor(wx), z: Math.floor(wz) };
+    }
+  }
+  dragging = false; lastTouchDist = 0;
+});
 
 // --- Tooltip ---
 function updateTooltip(mx, my) {
@@ -371,22 +403,21 @@ function updateTooltip(mx, my) {
 function updatePlayerList() {
   playersList.innerHTML = players.map(p =>
     `<div onclick="focusPlayer('${p.name.replace(/'/g, "\\'")}')" ` +
-    `style="${p.name === followPlayer ? 'color:#ff4444' : ''}"` +
+    `style="${p.name === botName ? 'color:#ff4444' : ''}"` +
     `>${p.name} (${Math.floor(p.x)}, ${Math.floor(p.z)})</div>`
   ).join("");
 }
 
 window.focusPlayer = function(name) {
-  if (followPlayer === name) {
-    followPlayer = null;
-  } else {
-    followPlayer = name;
-  }
-  updatePlayerList();
+  // Reset offset to center on bot
+  camOffsetX = 0;
+  camOffsetZ = 0;
   requestDraw();
 };
 
 // --- WebSocket ---
+let wsConn = null;
+
 function processChunk(c) {
   const data = Uint8Array.from(atob(c.data), ch => ch.charCodeAt(0));
   const chunk = { cx: c.cx, cz: c.cz, palette: c.palette, data, imageData: null, canvas: null };
@@ -401,6 +432,8 @@ function connect() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${proto}//${location.host}/ws`);
 
+  wsConn = ws;
+
   ws.onopen = () => {
     statusEl.textContent = "Connected";
     setTimeout(() => { statusEl.style.display = "none"; }, 2000);
@@ -410,17 +443,17 @@ function connect() {
     const msg = JSON.parse(ev.data);
 
     if (msg.type === "init" || msg.type === "update") {
+      if (msg.clip) clipRect = msg.clip;
       if (msg.chunks) {
         for (const c of msg.chunks) processChunk(c);
       }
       if (msg.players) {
         players = msg.players;
         updatePlayerList();
-        // Auto-follow first player on init
-        if (msg.type === "init" && players.length > 0 && !followPlayer) {
-          followPlayer = players[0].name;
-          updatePlayerList();
-        }
+      }
+      if (msg.type === "init" && msg.botName) {
+        botName = msg.botName;
+        updatePlayerList();
       }
       requestDraw();
     }

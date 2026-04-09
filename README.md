@@ -334,7 +334,7 @@ pytest tests/ -v
 | `proxy.py` | MITM プロキシ |
 | `terrain_gen.py` | 地形データ生成 |
 | `terrain_build.py` | 生成した地形データの配置 |
-| `map.py` | リアルタイムマップビューア (テクスチャアトラス + WebSocket) |
+| `map.py` | リアルタイムマップビューア (テクスチャアトラス + ブラウザからテレポート操作) |
 | `diagnose.py` | ネットワーク診断 |
 
 ## 依存ライブラリ
