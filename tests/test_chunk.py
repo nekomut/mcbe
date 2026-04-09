@@ -9,8 +9,10 @@ import pytest
 from mcbe.chunk import (
     _parse_block_storage,
     _read_varint32,
+    compute_block_hash,
     parse_level_chunk_top_blocks,
     parse_sub_chunk,
+    parse_sub_chunk_entries,
 )
 
 
@@ -146,11 +148,11 @@ class TestParseSubChunk:
         assert all(r == 7 for r in rids)
 
     def test_version_9(self):
-        """Version 9: storage_count + layers."""
+        """Version 9: storage_count + y_index + layers."""
         ids = [3] * 4096
         storage = _build_block_storage(ids, bits_per_block=0)
-        # storage_count=1
-        data = bytes([9, 1]) + storage
+        # storage_count=1, y_index=0
+        data = bytes([9, 1, 0]) + storage
         result = parse_sub_chunk(data)
         assert result is not None
         rids, _, _ = result
@@ -160,7 +162,8 @@ class TestParseSubChunk:
         """Version 9 with 2 layers: only layer 0 is returned."""
         layer0 = _build_block_storage([5] * 4096, bits_per_block=0)
         layer1 = _build_block_storage([99] * 4096, bits_per_block=0)
-        data = bytes([9, 2]) + layer0 + layer1
+        # storage_count=2, y_index=5
+        data = bytes([9, 2, 5]) + layer0 + layer1
         result = parse_sub_chunk(data)
         assert result is not None
         rids, _, _ = result
@@ -211,3 +214,139 @@ class TestParseLevelChunkTopBlocks:
 
     def test_empty_payload(self):
         assert parse_level_chunk_top_blocks(b"", 0, ["minecraft:air"]) is None
+
+
+class TestComputeBlockHash:
+    def test_empty_states_deterministic(self):
+        """Same name produces same hash."""
+        h1 = compute_block_hash("minecraft:stone")
+        h2 = compute_block_hash("minecraft:stone")
+        assert h1 == h2
+
+    def test_different_blocks(self):
+        """Different block names produce different hashes."""
+        h1 = compute_block_hash("minecraft:stone")
+        h2 = compute_block_hash("minecraft:dirt")
+        assert h1 != h2
+
+    def test_states_affect_hash(self):
+        """States change the hash value."""
+        h_empty = compute_block_hash("minecraft:water")
+        h_with = compute_block_hash("minecraft:water", {"liquid_depth": 0})
+        assert h_empty != h_with
+
+    def test_bit_suffix_uses_tag_byte(self):
+        """Properties ending in _bit produce different hashes than TAG_INT."""
+        # open_bit=0 as TAG_BYTE vs direction=0 as TAG_INT should differ
+        h1 = compute_block_hash("minecraft:test", {"open_bit": 0})
+        h2 = compute_block_hash("minecraft:test", {"direction": 0})
+        assert h1 != h2
+
+    def test_sorted_keys(self):
+        """Key order in input dict doesn't matter (keys are sorted internally)."""
+        h1 = compute_block_hash("minecraft:test", {"b": 1, "a": 0})
+        h2 = compute_block_hash("minecraft:test", {"a": 0, "b": 1})
+        assert h1 == h2
+
+
+class TestParseSubChunkEntries:
+    def _make_entry(
+        self,
+        ox: int, oy: int, oz: int,
+        result: int,
+        sub_data: bytes | None,
+        heightmap_type: int = 2,
+        heightmap_data: bytes | None = None,
+        render_heightmap_type: int = 2,
+        cache_enabled: bool = False,
+        blob_hash: int = 0,
+    ) -> bytes:
+        """Build a single raw SubChunk entry."""
+        out = bytearray()
+        out += struct.pack("bbb", ox, oy, oz)
+        out.append(result)
+        # Payload (length-prefixed).
+        has_payload = not cache_enabled or result != 6
+        if has_payload:
+            payload = sub_data or b""
+            out += _write_varint32(len(payload))
+            out += payload
+        # HeightMapType (0=TooHigh, 1=HasData, 2=TooLow).
+        out.append(heightmap_type)
+        if heightmap_type == 1:  # HasData
+            out += heightmap_data or bytes(256)
+        # RenderHeightMapType.
+        out.append(render_heightmap_type)
+        if render_heightmap_type == 1:
+            out += bytes(256)
+        if cache_enabled:
+            out += struct.pack("<Q", blob_hash)
+        return bytes(out)
+
+    def test_single_success_entry(self):
+        """Parse a single successful entry with heightmap data."""
+        ids = [42] * 4096
+        storage = _build_block_storage(ids, bits_per_block=0)
+        sub_data = bytes([8]) + storage  # version 8
+
+        entry = self._make_entry(0, -2, 0, result=1, sub_data=sub_data)
+        raw = struct.pack("<I", 1) + entry
+
+        results = parse_sub_chunk_entries(raw, cache_enabled=False)
+        assert len(results) == 1
+        (ox, oy, oz), rids, lp, rc = results[0]
+        assert (ox, oy, oz) == (0, -2, 0)
+        assert rids is not None
+        assert len(rids) == 4096
+        assert all(r == 42 for r in rids)
+        assert rc == 1
+
+    def test_two_entries_offset_correctness(self):
+        """Two entries: verify heightmap parsing doesn't corrupt second entry."""
+        ids1 = [10] * 4096
+        storage1 = _build_block_storage(ids1, bits_per_block=0)
+        sub1 = bytes([8]) + storage1
+
+        ids2 = [20] * 4096
+        storage2 = _build_block_storage(ids2, bits_per_block=0)
+        sub2 = bytes([8]) + storage2
+
+        entry1 = self._make_entry(0, -1, 0, result=1, sub_data=sub1)
+        entry2 = self._make_entry(0, 0, 0, result=1, sub_data=sub2)
+        raw = struct.pack("<I", 2) + entry1 + entry2
+
+        results = parse_sub_chunk_entries(raw, cache_enabled=False)
+        assert len(results) == 2
+
+        _, rids1, _, _ = results[0]
+        _, rids2, _, _ = results[1]
+        assert rids1 is not None and all(r == 10 for r in rids1)
+        assert rids2 is not None and all(r == 20 for r in rids2)
+
+    def test_all_air_no_cache(self):
+        """All-air entry with cache disabled still has empty payload."""
+        entry = self._make_entry(0, 0, 0, result=6, sub_data=b"",
+                                 heightmap_type=0)  # TooHigh, no data
+        raw = struct.pack("<I", 1) + entry
+
+        results = parse_sub_chunk_entries(raw, cache_enabled=False)
+        assert len(results) == 1
+        _, rids, _, rc = results[0]
+        assert rids is None  # not SUCCESS, so no parsed data
+        assert rc == 6
+
+    def test_heightmap_too_high(self):
+        """HeightMapType=0 (TooHigh) means no heightmap data follows."""
+        ids = [5] * 4096
+        storage = _build_block_storage(ids, bits_per_block=0)
+        sub = bytes([8]) + storage
+
+        entry = self._make_entry(0, 0, 0, result=1, sub_data=sub,
+                                 heightmap_type=0)
+        raw = struct.pack("<I", 1) + entry
+
+        results = parse_sub_chunk_entries(raw, cache_enabled=False)
+        assert len(results) == 1
+        _, rids, _, _ = results[0]
+        assert rids is not None
+        assert all(r == 5 for r in rids)

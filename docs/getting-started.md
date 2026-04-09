@@ -9,7 +9,7 @@ graph TB
         dial["クライアント接続\nDialer"]
         listen["サーバー起動\nListener"]
         proxy["MITM プロキシ"]
-        proto["パケット読み書き\n210+ パケット対応"]
+        proto["パケット読み書き\n214 パケット対応"]
     end
 
     subgraph transport["トランスポート"]
@@ -33,6 +33,7 @@ graph TB
         terrain["地形データ配置\n複数ボット並列"]
         bot["Bot 自動化"]
         analysis["パケット解析"]
+        mapview["マップビューア\nリアルタイム"]
     end
 
     auth --> dial
@@ -150,8 +151,12 @@ asyncio.run(main())
 | ファイル | 内容 |
 |---------|------|
 | `examples/client.py` | BDS への接続とパケット受信 |
-| `examples/lan_connect.py` | LAN ワールドへの接続 |
+| `examples/conn_lan_host.py` | LAN ワールドへの接続 |
+| `examples/get_block.py` | 指定座標のブロック情報を取得 |
 | `examples/place_block.py` | ブロック配置 (BDS / Realms 対応) |
+| `examples/list_realms.py` | Realms 一覧の取得 |
 | `examples/proxy.py` | MITM プロキシ |
-| `examples/terrain_build.py` | 地形データの大量配置 (複数ボット並列) |
-| `examples/conn_realms.py` | Realms 接続 |
+| `examples/terrain_gen.py` | 地形データ生成 |
+| `examples/terrain_build.py` | 生成した地形データの配置 (複数ボット並列) |
+| `examples/map.py` | リアルタイムマップビューア (テクスチャアトラス + WebSocket) |
+| `examples/diagnose.py` | ネットワーク診断 |

@@ -201,3 +201,4 @@ class BlockEntry:
     """A custom block entry with name and NBT properties."""
     name: str = ""
     properties: dict = field(default_factory=dict)
+    properties_typed: dict | None = field(default=None, repr=False)

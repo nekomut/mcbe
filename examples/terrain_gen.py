@@ -779,18 +779,20 @@ def main():
     parser.add_argument("--lon", type=float,
                         default=lon_default, required=lon_default is None,
                         help="中心経度")
-    parser.add_argument("--width", type=int, default=100,
+    parser.add_argument("-W", "--width", type=int, default=100,
                         help="X方向ブロック数 (default: 100)")
-    parser.add_argument("--height", type=int, default=100,
+    parser.add_argument("-H", "--height", type=int, default=100,
                         help="Z方向ブロック数 (default: 100)")
     parser.add_argument("--base-altitude", type=float, default=0.0,
                         help="基準標高 m (default: 0)")
     parser.add_argument("--scale", type=float, default=0.75,
                         help="m/block (default: 0.75)")
-    parser.add_argument("--x-offset", type=int, default=0,
-                        help="MC中心の X座標 (default: 0)")
-    parser.add_argument("--z-offset", type=int, default=0,
-                        help="MC中心の Z座標 (default: 0)")
+    parser.add_argument("-X", "--x-offset", type=int, default=0,
+                        help="地形中心の MC X座標 (default: 0)")
+    parser.add_argument("-Z", "--z-offset", type=int, default=0,
+                        help="地形中心の MC Z座標 (default: 0)")
+    parser.add_argument("--box", type=int, nargs=4, metavar=("X0", "Z0", "X1", "Z1"),
+                        help="矩形の角2点 (MC座標)")
     parser.add_argument("-o", "--output", default=None,
                         help="出力パス (default: examples/terrain.json)")
     parser.add_argument("--no-fill", action="store_true",
@@ -812,26 +814,37 @@ def main():
     blocks_per_deg_lat = m_per_deg_lat / scale
     blocks_per_deg_lon = m_per_deg_lon / scale
 
-    mc_x_start = args.x_offset - args.width // 2
-    mc_z_start = args.z_offset - args.height // 2
+    if args.box:
+        x0, z0, x1, z1 = args.box
+        mc_x_start = min(x0, x1)
+        mc_z_start = min(z0, z1)
+        width = abs(x1 - x0)
+        height = abs(z1 - z0)
+        if width == 0 or height == 0:
+            parser.error("--p0 と --p1 で面積のある矩形を指定してください")
+    else:
+        width = args.width
+        height = args.height
+        mc_x_start = args.x_offset - width // 2
+        mc_z_start = args.z_offset - height // 2
 
     print(f"中心: ({args.lat}, {args.lon})")
-    print(f"範囲: {args.width}×{args.height} ブロック ({scale}m/block)")
-    print(f"MC座標: X=[{mc_x_start}, {mc_x_start + args.width}), "
-          f"Z=[{mc_z_start}, {mc_z_start + args.height})")
+    print(f"範囲: {width}×{height} ブロック ({scale}m/block)")
+    print(f"MC座標: X=[{mc_x_start}, {mc_x_start + width}), "
+          f"Z=[{mc_z_start}, {mc_z_start + height})")
 
     t0 = time.monotonic()
 
     # DEM 取得・補間
     interp, dem_x, dem_z, dem_data = fetch_dem(
         args.lat, args.lon, mc_x_start, mc_z_start,
-        args.width, args.height, scale,
+        width, height, scale,
         blocks_per_deg_lat, blocks_per_deg_lon)
 
     # ベクトルタイル取得
     road_lines, water_polys, building_polys = fetch_vectors(
         args.lat, args.lon, mc_x_start, mc_z_start,
-        args.width, args.height,
+        width, height,
         blocks_per_deg_lat, blocks_per_deg_lon)
 
     # サーフェスマップ・建物マップ・橋マップ生成

@@ -89,7 +89,10 @@ def _write_block_entry(w: PacketWriter, entry: BlockEntry) -> None:
 
 
 def _read_block_entry(r: PacketReader) -> BlockEntry:
-    return BlockEntry(name=r.string(), properties=r.nbt())
+    name = r.string()
+    typed = r.nbt_typed()
+    plain = {k: v for k, (_, v) in typed.items()}
+    return BlockEntry(name=name, properties=plain, properties_typed=typed)
 
 
 @register_server_packet

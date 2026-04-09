@@ -34,6 +34,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from mcbe.chunk import (
     AIR,
+    compute_block_hash,
+    compute_block_hash_typed,
+    load_canonical_block_hashes,
     parse_level_chunk_top_blocks,
     parse_sub_chunk_entries,
     _extract_top_blocks,
@@ -63,6 +66,16 @@ logger = logging.getLogger(__name__)
 EXAMPLES_DIR = Path(__file__).parent
 HTML_PATH = EXAMPLES_DIR / "map.html"
 CACHE_DIR = EXAMPLES_DIR / ".map_cache"
+
+def _build_hash_table_from_names(block_names: list[str]) -> dict[int, str]:
+    """Build hash → block name table from a list of block names (empty states)."""
+    table: dict[int, str] = {}
+    for name in block_names:
+        if not name.startswith("minecraft:"):
+            name = f"minecraft:{name}"
+        h = compute_block_hash(name)
+        table[h] = name
+    return table
 
 # ── カラーフォールバック ─────────────────────────────────────────
 
@@ -101,6 +114,20 @@ FALLBACK_COLORS: dict[str, list[int] | None] = {
     "minecraft:leaves": [54, 122, 25],
     "minecraft:spruce_leaves": [40, 73, 40],
     "minecraft:birch_leaves": [80, 132, 48],
+    "minecraft:jungle_leaves": [48, 122, 19],
+    "minecraft:acacia_leaves": [76, 116, 34],
+    "minecraft:dark_oak_leaves": [54, 122, 25],
+    "minecraft:mangrove_leaves": [57, 122, 20],
+    "minecraft:azalea_leaves": [87, 120, 45],
+    "minecraft:azalea_leaves_flowered": [87, 120, 45],
+    "minecraft:leaves": [54, 122, 25],
+    "minecraft:leaves2": [54, 122, 25],
+    "minecraft:short_grass": [91, 153, 48],
+    "minecraft:tall_grass": [91, 153, 48],
+    "minecraft:fern": [78, 137, 41],
+    "minecraft:large_fern": [78, 137, 41],
+    "minecraft:vine": [54, 122, 25],
+    "minecraft:lily_pad": [32, 128, 48],
     "minecraft:sponge": [195, 192, 74],
     "minecraft:glass": [175, 213, 220],
     "minecraft:lapis_ore": [99, 110, 140],
@@ -182,19 +209,20 @@ def _load_jsonc(path: Path) -> dict:
     return json.loads(text)
 
 
-def _generate_colors_from_resource_pack(rp_path: Path) -> dict[str, list[int] | None]:
-    """Generate block color table from a resource pack directory."""
+def _iter_block_textures(rp_path: Path):
+    """Yield ``(block_name, img_path)`` for blocks with a resolvable top-face texture.
+
+    *block_name* is the bare name (e.g. ``"stone"``), *img_path* is the
+    absolute path to the source image file (.png or .tga).
+    """
     blocks_json = rp_path / "blocks.json"
     terrain_json = rp_path / "textures" / "terrain_texture.json"
     if not blocks_json.exists() or not terrain_json.exists():
-        return {}
+        return
 
     blocks = _load_jsonc(blocks_json)
     terrain = _load_jsonc(terrain_json)
-
     texture_data = terrain.get("texture_data", {})
-    textures_dir = rp_path / "textures" / "blocks"
-    colors: dict[str, list[int] | None] = {"minecraft:air": None}
 
     for block_name, block_info in blocks.items():
         if not isinstance(block_info, dict):
@@ -229,43 +257,247 @@ def _generate_colors_from_resource_pack(rp_path: Path) -> dict[str, list[int] | 
         if textures is None:
             continue
 
-        # Resolve file path.
-        file_path = None
+        # Resolve file path: collect all candidates to try.
+        file_paths: list[str] = []
         if isinstance(textures, str):
-            file_path = textures
+            file_paths.append(textures)
         elif isinstance(textures, dict):
-            file_path = textures.get("path")
+            p = textures.get("path")
+            if p:
+                file_paths.append(p)
         elif isinstance(textures, list):
-            first = textures[0]
-            if isinstance(first, str):
-                file_path = first
-            elif isinstance(first, dict):
-                file_path = first.get("path")
+            for entry in textures:
+                if isinstance(entry, str):
+                    file_paths.append(entry)
+                elif isinstance(entry, dict):
+                    p = entry.get("path")
+                    if p:
+                        file_paths.append(p)
 
-        if not file_path:
-            continue
+        # Deduplicate while preserving order.
+        seen_paths: set[str] = set()
+        unique_paths: list[str] = []
+        for p in file_paths:
+            if p not in seen_paths:
+                seen_paths.add(p)
+                unique_paths.append(p)
 
-        # Load PNG and compute average color.
-        png_path = rp_path / (file_path + ".png")
-        if not png_path.exists():
-            # Try without extension.
-            png_path = rp_path / file_path
-            if not png_path.exists():
-                continue
+        for candidate in unique_paths:
+            img_path = _resolve_texture_path(rp_path, candidate)
+            if img_path is not None:
+                yield block_name, img_path
+                break
 
+
+def _generate_colors_from_resource_pack(rp_path: Path) -> dict[str, list[int] | None]:
+    """Generate block color table from a resource pack directory."""
+    colors: dict[str, list[int] | None] = {"minecraft:air": None}
+    for block_name, img_path in _iter_block_textures(rp_path):
         try:
-            avg = _average_png_color(png_path)
+            avg = _average_png_color(img_path)
             if avg:
-                full_name = f"minecraft:{block_name}"
-                colors[full_name] = avg
+                colors[f"minecraft:{block_name}"] = avg
         except Exception:
             pass
-
     return colors
 
 
+# Blocks whose textures are greyscale and tinted at runtime.
+# Tint color = default biome appearance (plains-like).
+_TINT_MAP: dict[str, tuple[int, int, int]] = {
+    # grass / ground cover
+    "grass": (91, 153, 48),
+    "tallgrass": (91, 153, 48),
+    "short_grass": (91, 153, 48),
+    "tall_grass": (91, 153, 48),
+    "fern": (78, 137, 41),
+    "large_fern": (78, 137, 41),
+    "double_plant": (91, 153, 48),
+    "vine": (54, 122, 25),
+    "lily_pad": (32, 128, 48),
+    # leaves
+    "oak_leaves": (54, 122, 25),
+    "leaves": (54, 122, 25),
+    "leaves2": (54, 122, 25),
+    "spruce_leaves": (40, 73, 40),
+    "birch_leaves": (80, 132, 48),
+    "jungle_leaves": (48, 122, 19),
+    "acacia_leaves": (76, 116, 34),
+    "dark_oak_leaves": (54, 122, 25),
+    "mangrove_leaves": (57, 122, 20),
+    "azalea_leaves": (87, 120, 45),
+    "azalea_leaves_flowered": (87, 120, 45),
+    # water
+    "water": (64, 64, 255),
+    "flowing_water": (64, 64, 255),
+}
+
+
+def _save_texture(src_path: Path, dst: Path, tint: tuple[int, int, int] | None) -> None:
+    """Save a block texture to *dst*, optionally applying a tint."""
+    from PIL import Image
+
+    img = Image.open(src_path).convert("RGBA")
+    if tint is not None:
+        # Multiply greyscale luminance by tint colour.
+        pixels = img.load()
+        for y in range(img.height):
+            for x in range(img.width):
+                r, g, b, a = pixels[x, y]
+                grey = (r + g + b) // 3
+                pixels[x, y] = (
+                    grey * tint[0] // 255,
+                    grey * tint[1] // 255,
+                    grey * tint[2] // 255,
+                    a,
+                )
+    img.save(dst, "PNG")
+
+
+def _cache_block_textures(rp_path: Path) -> None:
+    """Copy top-face block textures to ``.map_cache/textures/``.
+
+    Each block is saved as ``<block_name>.png`` (e.g. ``stone.png``).
+    Greyscale tinted blocks (grass, leaves, water …) are coloured with a
+    default biome tint.  Files that already exist are skipped.
+    """
+    dest_dir = CACHE_DIR / "textures"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    skipped = 0
+    for block_name, src_path in _iter_block_textures(rp_path):
+        dst = dest_dir / f"{block_name}.png"
+        if dst.exists():
+            skipped += 1
+            continue
+        try:
+            tint = _TINT_MAP.get(block_name)
+            if tint is not None or src_path.suffix.lower() != ".png":
+                _save_texture(src_path, dst, tint)
+            else:
+                import shutil
+                shutil.copy2(src_path, dst)
+            copied += 1
+        except Exception as e:
+            logger.debug("テクスチャコピー失敗 %s: %s", block_name, e)
+    logger.info("テクスチャキャッシュ: %d コピー, %d スキップ (%s)", copied, skipped, dest_dir)
+
+
+def _build_texture_atlas() -> tuple[bytes | None, dict]:
+    """Build a texture atlas PNG and mapping from cached block textures.
+
+    Returns ``(atlas_png_bytes, mapping_dict)``.  The mapping contains
+    ``tile_size``, ``columns``, and ``blocks: {name: [col, row]}``.
+    Results are cached to disk so PIL is only needed on first run.
+    """
+    tex_dir = CACHE_DIR / "textures"
+    atlas_cache = CACHE_DIR / "texture_atlas.png"
+    mapping_cache = CACHE_DIR / "texture_atlas.json"
+
+    # Return disk cache if available.
+    if atlas_cache.exists() and mapping_cache.exists():
+        try:
+            atlas_bytes = atlas_cache.read_bytes()
+            with open(mapping_cache) as f:
+                mapping = json.load(f)
+            logger.info(
+                "テクスチャアトラス: キャッシュから読み込み (%d ブロック)",
+                len(mapping.get("blocks", {})),
+            )
+            return atlas_bytes, mapping
+        except Exception:
+            pass
+
+    if not tex_dir.exists():
+        return None, {}
+
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("PIL が利用できないためテクスチャアトラスは無効")
+        return None, {}
+
+    textures = sorted(tex_dir.glob("*.png"))
+    if not textures:
+        return None, {}
+
+    TILE = 16
+    COLS = 48
+    rows_needed = (len(textures) + COLS - 1) // COLS
+
+    atlas = Image.new("RGBA", (COLS * TILE, rows_needed * TILE), (0, 0, 0, 0))
+    blocks_mapping: dict[str, list[int]] = {}
+
+    for i, tex_path in enumerate(textures):
+        col = i % COLS
+        row = i // COLS
+        try:
+            img = Image.open(tex_path).convert("RGBA")
+            if img.size != (TILE, TILE):
+                img = img.resize((TILE, TILE), Image.NEAREST)
+            atlas.paste(img, (col * TILE, row * TILE))
+            blocks_mapping[f"minecraft:{tex_path.stem}"] = [col, row]
+        except Exception as e:
+            logger.debug("テクスチャ読み込み失敗 %s: %s", tex_path.stem, e)
+
+    # Add aliases for protocol names that differ from blocks.json keys.
+    _BLOCK_RENAMES: dict[str, str] = {
+        "grass_block": "grass",
+        "sea_lantern": "seaLantern",
+        "concrete_powder": "concretePowder",
+        "invisible_bedrock": "invisibleBedrock",
+        "moving_block": "movingBlock",
+        "piston_arm_collision": "pistonArmCollision",
+        "sticky_piston_arm_collision": "stickyPistonArmCollision",
+        "trip_wire": "tripWire",
+    }
+    for proto_name, tex_name in _BLOCK_RENAMES.items():
+        key = f"minecraft:{proto_name}"
+        src = f"minecraft:{tex_name}"
+        if key not in blocks_mapping and src in blocks_mapping:
+            blocks_mapping[key] = blocks_mapping[src]
+
+    from io import BytesIO as _BytesIO
+
+    buf = _BytesIO()
+    atlas.save(buf, "PNG")
+    atlas_bytes = buf.getvalue()
+
+    mapping = {
+        "tile_size": TILE,
+        "columns": COLS,
+        "blocks": blocks_mapping,
+    }
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    atlas_cache.write_bytes(atlas_bytes)
+    with open(mapping_cache, "w") as f:
+        json.dump(mapping, f)
+
+    logger.info(
+        "テクスチャアトラス生成: %d ブロック (%dx%d)",
+        len(blocks_mapping),
+        COLS * TILE,
+        rows_needed * TILE,
+    )
+    return atlas_bytes, mapping
+
+
+def _resolve_texture_path(rp_path: Path, file_path: str) -> Path | None:
+    """Resolve a texture file path, trying .png and .tga extensions."""
+    for ext in (".png", ".tga"):
+        p = rp_path / (file_path + ext)
+        if p.exists():
+            return p
+    # Try without extension (file may already have one).
+    p = rp_path / file_path
+    if p.exists():
+        return p
+    return None
+
+
 def _average_png_color(path: Path) -> list[int] | None:
-    """Compute average RGB from a PNG file (simple parser for small textures)."""
+    """Compute average RGB from an image file (PNG or TGA)."""
     try:
         from PIL import Image
         img = Image.open(path).convert("RGBA")
@@ -293,25 +525,21 @@ def _average_png_color(path: Path) -> list[int] | None:
         return None
 
 
-def load_block_colors(resource_pack: str | None = None) -> dict[str, list[int] | None]:
-    """Load or generate block color table."""
+def load_block_colors(
+    resource_pack: str | None = None,
+    state: MapState | None = None,
+) -> dict[str, list[int] | None]:
+    """Load or generate block color table.
+
+    If *state* is provided, also builds the FNV-1a hash → block name table
+    from the blocks.json found alongside the resource pack.
+    """
     cache_path = CACHE_DIR / "block_colors.json"
 
-    # 1. Cached colors.
-    if cache_path.exists():
-        try:
-            with open(cache_path) as f:
-                colors = json.load(f)
-            logger.info("カラーテーブルをキャッシュから読み込み: %d ブロック", len(colors))
-            return colors
-        except Exception:
-            pass
-
-    # 2. Generate from resource pack.
-    rp_paths = []
+    # Detect resource pack paths (used for both colors and texture cache).
+    rp_paths: list[Path] = []
     if resource_pack:
         rp_paths.append(Path(resource_pack))
-    # Auto-detect bedrock-samples.
     for candidate in [
         EXAMPLES_DIR.parent.parent / "bedrock-samples" / "resource_pack",
         EXAMPLES_DIR.parent / "bedrock-samples" / "resource_pack",
@@ -319,22 +547,53 @@ def load_block_colors(resource_pack: str | None = None) -> dict[str, list[int] |
         if candidate.exists():
             rp_paths.append(candidate)
 
+    # Cache block textures (skips files that already exist).
+    for rp in rp_paths:
+        _cache_block_textures(rp)
+        break  # one resource pack is enough
+
+    # 1. Cached colors.
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                colors = json.load(f)
+            logger.info("カラーテーブルをキャッシュから読み込み: %d ブロック", len(colors))
+            if state is not None:
+                _init_hash_table(state, colors)
+            return colors
+        except Exception:
+            pass
+
+    # 2. Generate from resource pack.
     for rp in rp_paths:
         colors = _generate_colors_from_resource_pack(rp)
         if colors and len(colors) > 10:
-            # Merge with fallback for missing entries.
-            merged = dict(FALLBACK_COLORS)
-            merged.update(colors)
-            # Save cache.
+            merged = dict(colors)
+            merged.update(FALLBACK_COLORS)
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             with open(cache_path, "w") as f:
                 json.dump(merged, f)
             logger.info("カラーテーブルを生成: %d ブロック (%s)", len(merged), rp)
+            if state is not None:
+                _init_hash_table(state, merged)
             return merged
 
     # 3. Fallback.
     logger.info("フォールバックカラーテーブルを使用: %d ブロック", len(FALLBACK_COLORS))
+    if state is not None:
+        _init_hash_table(state, FALLBACK_COLORS)
     return dict(FALLBACK_COLORS)
+
+
+def _init_hash_table(state: MapState, colors: dict[str, list[int] | None]) -> None:
+    """Pre-load canonical block state hashes.
+
+    The canonical hash table covers all vanilla block states with correct
+    NBT types, ensuring proper hash resolution for Realms and BDS servers.
+    """
+    canonical = load_canonical_block_hashes()
+    state.hash_table.update(canonical)
+    logger.info("初期ハッシュテーブル: %d エントリ (canonical block states)", len(state.hash_table))
 
 
 # ── ログ設定 ─────────────────────────────────────────────────────
@@ -379,7 +638,9 @@ class PlayerInfo:
 class MapState:
     block_palette: list[str] = field(default_factory=list)
     use_hashes: bool = False
+    hash_table: dict[int, str] = field(default_factory=dict)
     chunks: dict[tuple[int, int], list[str]] = field(default_factory=dict)
+    chunk_top_y: dict[tuple[int, int], list[int]] = field(default_factory=dict)
     players: dict[int, PlayerInfo] = field(default_factory=dict)
     bot_entity_id: int = 0
     world_name: str = ""
@@ -404,7 +665,7 @@ class MapState:
         (chunks_dir / f"{cx}_{cz}.bin").write_bytes(data)
 
     def load_cache(self) -> None:
-        """Load cached chunks from disk."""
+        """Load cached chunks from disk and mark them dirty for broadcast."""
         if self.cache_dir is None:
             return
         chunks_dir = self.cache_dir / "chunks"
@@ -421,6 +682,11 @@ class MapState:
                 grid = raw[newline + 1:]
                 if len(grid) == 256:
                     self.chunks[(cx, cz)] = [palette[b] for b in grid]
+                    # Cached data is stale; low Y lets live sub-chunks
+                    # overwrite it.  Higher sub-chunks will then overwrite
+                    # lower ones via the Y tracking in _handle_sub_chunk.
+                    self.chunk_top_y[(cx, cz)] = [-9999] * 256
+                    self.dirty_chunks.add((cx, cz))
                     count += 1
             except Exception:
                 continue
@@ -494,6 +760,23 @@ class MapDialer(Dialer):
                     name="bot", x=pk.player_position.x,
                     y=pk.player_position.y, z=pk.player_position.z,
                 )
+
+                # Build hash table from canonical block states.
+                if state.use_hashes:
+                    canonical = load_canonical_block_hashes()
+                    state.hash_table.update(canonical)
+                    # Also add any custom block entries from StartGame.
+                    for entry in pk.blocks:
+                        if entry.properties_typed is not None:
+                            h = compute_block_hash_typed(entry.name, entry.properties_typed)
+                        else:
+                            h = compute_block_hash(entry.name, entry.properties)
+                        state.hash_table[h] = entry.name
+                    logger.info(
+                        "ハッシュテーブル: canonical=%d + StartGame=%d → %d エントリ",
+                        len(canonical), len(pk.blocks), len(state.hash_table),
+                    )
+
                 logger.info("StartGame: world=%s blocks=%d entity_id=%d hashes=%s",
                             pk.world_name, len(state.block_palette),
                             pk.entity_runtime_id, pk.use_block_network_id_hashes)
@@ -556,20 +839,20 @@ def _handle_level_chunk(
     cx, cz = pk.position.x, pk.position.z
     sc = pk.sub_chunk_count
 
-    logger.debug("LevelChunk (%d,%d) sub_chunk_count=%d payload=%d bytes",
-                 cx, cz, sc, len(pk.raw_payload))
-
     if sc >= SUB_CHUNK_REQUEST_MODE_LIMITED:
-        logger.debug("  → sub-chunk request mode (highest=%d)", pk.highest_sub_chunk)
         return (cx, cz, pk.dimension, pk.highest_sub_chunk)
 
     try:
-        top = parse_level_chunk_top_blocks(pk.raw_payload, sc, state.block_palette)
+        ht = state.hash_table if state.use_hashes else None
+        top = parse_level_chunk_top_blocks(pk.raw_payload, sc, state.block_palette, ht)
         if top:
             state.chunks[(cx, cz)] = top
             state.dirty_chunks.add((cx, cz))
             state.save_chunk(cx, cz)
-            logger.debug("  → parsed %d top blocks", sum(1 for b in top if b != AIR))
+            non_air = sum(1 for b in top if b != AIR)
+            if len(state.chunks) <= 5 or len(state.chunks) % 50 == 0:
+                logger.info("LevelChunk (%d,%d) sc=%d non_air=%d total=%d",
+                            cx, cz, sc, non_air, len(state.chunks))
     except Exception as e:
         logger.debug("LevelChunk parse error at (%d,%d): %s", cx, cz, e)
     return None
@@ -595,35 +878,25 @@ async def _send_sub_chunk_request(
         logger.debug("SubChunkRequest send error: %s", e)
 
 
+_sub_chunk_count = 0  # diagnostic counter
+
+
 def _handle_sub_chunk(pk: SubChunk, state: MapState) -> None:
     """Process a SubChunk packet."""
-    logger.debug("SubChunk pos=(%d,%d,%d) entries=%d bytes cache=%s",
-                 pk.position.x, pk.position.y, pk.position.z,
-                 len(pk.sub_chunk_entries), pk.cache_enabled)
+    global _sub_chunk_count
+    ht = state.hash_table if state.use_hashes else None
     try:
-        entries = parse_sub_chunk_entries(pk.sub_chunk_entries, pk.cache_enabled)
+        entries = parse_sub_chunk_entries(pk.sub_chunk_entries, pk.cache_enabled, ht)
     except Exception as e:
         logger.debug("SubChunk parse error: %s", e)
         return
 
-    logger.debug("  → parsed %d entries", len(entries))
     base_x = pk.position.x
     base_z = pk.position.z
 
-    non_air_total = 0
-    for (ox, oy, oz), ids, local_palette in entries:
-        if ids is not None:
-            pal = local_palette if local_palette is not None else state.block_palette
-            pal_len = len(pal)
-            non_air = sum(1 for i in ids if i < pal_len and pal[i] != AIR)
-        else:
-            non_air = 0
-        lp_detail = local_palette[:5] if local_palette else local_palette
-        logger.debug("    entry (%d,%d,%d) ids=%s lp=%s non_air=%d lp_detail=%s",
-                     ox, oy, oz,
-                     "None" if ids is None else len(ids),
-                     "None" if local_palette is None else len(local_palette),
-                     non_air, lp_detail)
+    _sub_chunk_count += 1
+
+    for (ox, oy, oz), ids, local_palette, rc in entries:
         if ids is None:
             continue
         chunk_x = base_x + ox
@@ -632,15 +905,20 @@ def _handle_sub_chunk(pk: SubChunk, state: MapState) -> None:
         key = (chunk_x, chunk_z)
         if key not in state.chunks:
             state.chunks[key] = [AIR] * 256
+            state.chunk_top_y[key] = [-9999] * 256
 
-        # Use local palette (NBT mode) or global palette.
+        # When hash_table is provided, chunk.py resolves hashes internally
+        # and always returns a local_palette.  Otherwise fall back to global.
         if local_palette is not None:
             pal = local_palette
+            pal_len = len(pal)
         else:
             pal = state.block_palette
-        pal_len = len(pal)
+            pal_len = len(pal)
 
         existing = state.chunks[key]
+        top_y = state.chunk_top_y[key]
+        base_block_y = oy * 16
         for x in range(16):
             for z in range(16):
                 col = x * 16 + z
@@ -648,7 +926,10 @@ def _handle_sub_chunk(pk: SubChunk, state: MapState) -> None:
                     rid = ids[(x << 8) | (z << 4) | y]
                     name = pal[rid] if rid < pal_len else AIR
                     if name != AIR:
-                        existing[col] = name
+                        abs_y = base_block_y + y
+                        if abs_y >= top_y[col]:
+                            existing[col] = name
+                            top_y[col] = abs_y
                         break
 
         state.dirty_chunks.add(key)
@@ -667,6 +948,18 @@ async def serve_html(request: web.Request) -> web.Response:
 async def serve_block_colors(request: web.Request) -> web.Response:
     colors = request.app["block_colors"]
     return web.json_response(colors)
+
+
+async def serve_texture_atlas(request: web.Request) -> web.Response:
+    atlas_bytes = request.app.get("texture_atlas")
+    if atlas_bytes is None:
+        return web.Response(status=404)
+    return web.Response(body=atlas_bytes, content_type="image/png")
+
+
+async def serve_texture_mapping(request: web.Request) -> web.Response:
+    mapping = request.app.get("texture_mapping", {})
+    return web.json_response(mapping)
 
 
 async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
@@ -764,13 +1057,19 @@ async def start_web_server(
     ws_clients: set[web.WebSocketResponse],
     port: int,
 ) -> tuple[web.AppRunner, asyncio.Task]:
+    atlas_bytes, texture_mapping = _build_texture_atlas()
+
     app = web.Application()
     app["state"] = state
     app["block_colors"] = block_colors
     app["ws_clients"] = ws_clients
+    app["texture_atlas"] = atlas_bytes
+    app["texture_mapping"] = texture_mapping
 
     app.router.add_get("/", serve_html)
     app.router.add_get("/block_colors.json", serve_block_colors)
+    app.router.add_get("/texture_atlas.png", serve_texture_atlas)
+    app.router.add_get("/texture_atlas.json", serve_texture_mapping)
     app.router.add_get("/ws", websocket_handler)
 
     runner = web.AppRunner(app, access_log=None)
@@ -877,18 +1176,51 @@ async def _recv_loop(conn: Connection, state: MapState) -> None:
 
 
 async def _teleport_loop(conn: Connection, state: MapState) -> None:
-    """Periodically query player positions and teleport to them."""
+    """Periodically query player positions and teleport to cover all areas."""
     await asyncio.sleep(3.0)  # Wait for initial chunks.
 
+    last_tp_target: tuple[float, float] | None = None
+
     while not conn.closed:
+        # Collect other players' positions (exclude bot).
+        other_players = [
+            p for eid, p in state.players.items()
+            if eid != state.bot_entity_id and p.name != "bot"
+        ]
+
+        if other_players:
+            # Teleport to the first non-bot player's position.
+            target = other_players[0]
+            tp_x, tp_z = target.x, target.z
+        else:
+            # No other players — default to (0, 0).
+            tp_x, tp_z = 0.0, 0.0
+
+        # Only teleport if target changed significantly.
+        if last_tp_target is None or (
+            abs(tp_x - last_tp_target[0]) > 16 or abs(tp_z - last_tp_target[1]) > 16
+        ):
+            try:
+                await conn.write_packet(CommandRequest(
+                    command_line=f"/tp @s {tp_x:.0f} 320 {tp_z:.0f}",
+                    command_origin=CommandOrigin(
+                        origin=ORIGIN_AUTOMATION_PLAYER,
+                        request_id=str(_uuid.uuid4()),
+                    ),
+                    internal=False,
+                ))
+                await conn.flush()
+                last_tp_target = (tp_x, tp_z)
+            except Exception:
+                break
+
+        # Query all player positions.
         try:
-            # Query all player positions.
-            request_id = str(_uuid.uuid4())
             await conn.write_packet(CommandRequest(
                 command_line="/querytarget @a",
                 command_origin=CommandOrigin(
                     origin=ORIGIN_AUTOMATION_PLAYER,
-                    request_id=request_id,
+                    request_id=str(_uuid.uuid4()),
                 ),
                 internal=False,
             ))
@@ -1114,8 +1446,8 @@ async def _resolve_realms(invite_code: str | None = None, backend: str | None = 
 async def main(args: argparse.Namespace) -> None:
     _setup_logging(getattr(logging, args.log_level))
 
-    block_colors = load_block_colors(getattr(args, "resource_pack", None))
     state = MapState()
+    block_colors = load_block_colors(getattr(args, "resource_pack", None), state=state)
 
     if args.proxy:
         await run_proxy(args.listen, args.remote, state, block_colors, args.web_port)
@@ -1138,7 +1470,7 @@ if __name__ == "__main__":
     parser.add_argument("--remote", default="127.0.0.1:19132", help="proxy: remote address")
     parser.add_argument("--web-port", type=int, default=8080)
     parser.add_argument("--resource-pack", default=None, help="リソースパックパス")
-    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING"], default="WARNING")
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING"], default="INFO")
     args = parser.parse_args()
     try:
         asyncio.run(main(args))

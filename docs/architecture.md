@@ -30,14 +30,14 @@
     │  pool.py     パケットレジストリ + Encoder  │
     │  encryption.py  AES-256-CTR 暗号化        │
     │  login/      IdentityData, ClientData, JWT│
-    │  packet/     212 パケット定義               │
+    │  packet/     214 パケット定義               │
     └──────────────────────────────────────────┘
 
-    ┌──────────┐  ┌──────────┐  ┌──────────┐
-    │  auth/   │  │   nbt/   │  │ resource/ │
-    │ MS/Xbox  │  │ NBT codec│  │ リソース  │
-    │ 認証     │  │          │  │ パック    │
-    └──────────┘  └──────────┘  └──────────┘
+    ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+    │  auth/   │  │   nbt/   │  │ resource/ │  │ chunk.py │
+    │ MS/Xbox  │  │ NBT codec│  │ リソース  │  │ SubChunk │
+    │ 認証     │  │          │  │ パック    │  │ パーサ   │
+    └──────────┘  └──────────┘  └──────────┘  └──────────┘
 ```
 
 ## 主要モジュール
@@ -111,6 +111,17 @@ Transport
 ```
 
 > **NetherNet の場合:** バッチヘッダ (0xFE) は付与されず、Minecraft 層の暗号化も無効 (DTLS がトランスポート層で暗号化を担当)。
+
+## チャンク解析 (`chunk.py`)
+
+SubChunk パケットのバイナリデータからブロック情報を抽出するモジュール。
+
+- **`parse_sub_chunk_entries()`** --- SubChunkResponse のバイナリエントリを解析し、各サブチャンクのブロックストレージ (4096 ブロック) を返す。HeightMap / RenderHeightMap の読み飛ばしも処理
+- **`parse_sub_chunk()`** --- 単一サブチャンクデータ (Version 8/9) をパースし、ブロックランタイム ID 配列を返す
+- **`parse_level_chunk_top_blocks()`** --- LevelChunk パケットから各カラムの最上面ブロックを抽出
+- **`compute_block_hash()`** --- ブロック名 + 状態から FNV-1a ハッシュを計算 (canonical_block_states.nbt との照合用)
+
+`data/canonical_block_states.nbt` にプロトコルバージョン対応の全ブロック状態定義を格納している。
 
 ## プロトコルフロー概要
 

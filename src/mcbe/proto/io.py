@@ -253,6 +253,20 @@ class PacketReader:
         self._buf.seek(pos + len(encoded))
         return result
 
+    def nbt_typed(self) -> dict[str, tuple[int, object]]:
+        """Read NBT data with type preservation (NetworkLittleEndian).
+
+        Returns a typed compound: ``dict[str, (tag_type, value)]``.
+        Uses streaming decode so buffer position is advanced correctly.
+        """
+        from mcbe.chunk import _decode_typed, _TAG_COMPOUND, _TAG_END, _nle_read_string
+        tag_type = self._buf.read(1)
+        if not tag_type or tag_type[0] == _TAG_END:
+            return {}
+        _nle_read_string(self._buf)  # root name
+        result = _decode_typed(self._buf, _TAG_COMPOUND)
+        return result  # type: ignore[return-value]
+
 
 class PacketWriter:
     """Writes binary data to a buffer in Minecraft Bedrock protocol format."""

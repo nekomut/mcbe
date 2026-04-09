@@ -5,13 +5,15 @@
 ## 特徴
 
 - **asyncio ネイティブ** --- 全通信が async/await で動作
-- **212 パケット定義** --- dataclass + read/write メソッドによる型安全なシリアライズ
+- **214 パケット定義** --- dataclass + read/write メソッドによる型安全なシリアライズ
 - **RakNet 実装** --- 自作の非同期 RakNet クライアント/サーバー (UDP)
 - **暗号化** --- ECDSA P-384 ECDH 鍵交換 + AES-256-CTR パケット暗号化
 - **認証** --- Microsoft Live OAuth2 → Xbox Live → Minecraft JWT チェーン
 - **NBT** --- NetworkLittleEndian / LittleEndian / BigEndian の3エンコーディング対応
 - **リソースパック** --- ZIP/ディレクトリからの読み込み、チャンク分割転送
 - **テキスト** --- Minecraft カラーコード / ANSI 変換 / HTML タグ変換
+- **Realms (NetherNet)** --- WebRTC DataChannel 経由の Realms 接続 (libdatachannel / aiortc 両対応)
+- **チャンク解析** --- SubChunk パケットからブロックストレージを解析、最上面ブロック抽出
 
 ## ドキュメント
 

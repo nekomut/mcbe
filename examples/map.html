@@ -52,9 +52,15 @@ const statusEl = document.getElementById("status");
 
 // --- State ---
 let blockColors = {};        // "minecraft:stone" -> [r,g,b] | null
-let chunkCache = new Map();  // "cx,cz" -> { palette, data(Uint8Array), imageData }
+let chunkCache = new Map();  // "cx,cz" -> { palette, data(Uint8Array), canvas }
 let players = [];
 let totalChunks = 0;
+
+// Texture atlas
+let atlasImage = null;
+let atlasBlocks = {};        // "minecraft:stone" -> [col, row]
+let TILE_SIZE = 16;
+let atlasReady = false;
 
 // Camera: world coords at center of screen
 let camX = 0, camZ = 0;
@@ -66,16 +72,16 @@ let dragging = false, dragStartX = 0, dragStartY = 0, dragCamX = 0, dragCamZ = 0
 let followPlayer = null;
 
 // --- Coordinate conversion ---
-// MC: X+ = east, Z+ = south.  Screen: right = east, up = north (Z-).
+// MC: X+ = east, Z+ = south.  Screen: right = east, down = south (Z+).
 function worldToScreen(wx, wz) {
   const sx = (wx - camX) * zoom + canvas.width / 2;
-  const sy = (-wz + camZ) * zoom + canvas.height / 2;  // flip Z
+  const sy = (wz - camZ) * zoom + canvas.height / 2;
   return [sx, sy];
 }
 
 function screenToWorld(sx, sy) {
   const wx = (sx - canvas.width / 2) / zoom + camX;
-  const wz = -((sy - canvas.height / 2) / zoom - camZ);
+  const wz = (sy - canvas.height / 2) / zoom + camZ;
   return [wx, wz];
 }
 
@@ -100,29 +106,58 @@ function getBlockColor(name) {
 function buildChunkImage(chunk) {
   // chunk.palette: string[], chunk.data: Uint8Array(256)
   // data[i] = palette index, i = x*16 + z (x=column, z=row within chunk)
-  const img = ctx.createImageData(16, 16);
-  const d = img.data;
-  for (let x = 0; x < 16; x++) {
-    for (let z = 0; z < 16; z++) {
-      const idx = x * 16 + z;
-      const blockName = chunk.palette[chunk.data[idx]] || "minecraft:air";
-      const color = getBlockColor(blockName);
-      // Canvas pixel: px_x = x (east), px_y = 15-z (north up, Z+ is south = down)
-      const px = (x + (15 - z) * 16) * 4;
-      if (color) {
-        d[px] = color[0]; d[px+1] = color[1]; d[px+2] = color[2]; d[px+3] = 255;
-      } else {
-        d[px] = 0; d[px+1] = 0; d[px+2] = 0; d[px+3] = 0;
+  if (atlasReady) {
+    // Texture mode: 256x256 canvas (16px per block)
+    const CHUNK_PX = 16 * TILE_SIZE;
+    const offscreen = document.createElement("canvas");
+    offscreen.width = CHUNK_PX;
+    offscreen.height = CHUNK_PX;
+    const octx = offscreen.getContext("2d");
+    octx.imageSmoothingEnabled = false;
+
+    for (let x = 0; x < 16; x++) {
+      for (let z = 0; z < 16; z++) {
+        const idx = x * 16 + z;
+        const blockName = chunk.palette[chunk.data[idx]] || "minecraft:air";
+        const pos = atlasBlocks[blockName];
+        if (pos) {
+          octx.drawImage(
+            atlasImage,
+            pos[0] * TILE_SIZE, pos[1] * TILE_SIZE, TILE_SIZE, TILE_SIZE,
+            x * TILE_SIZE, z * TILE_SIZE, TILE_SIZE, TILE_SIZE
+          );
+        } else {
+          const color = getBlockColor(blockName);
+          if (color) {
+            octx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
+            octx.fillRect(x * TILE_SIZE, z * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+          }
+        }
       }
     }
+    chunk.canvas = offscreen;
+  } else {
+    // Flat color mode: 16x16 canvas (1px per block)
+    const img = ctx.createImageData(16, 16);
+    const d = img.data;
+    for (let x = 0; x < 16; x++) {
+      for (let z = 0; z < 16; z++) {
+        const idx = x * 16 + z;
+        const blockName = chunk.palette[chunk.data[idx]] || "minecraft:air";
+        const color = getBlockColor(blockName);
+        const px = (x + z * 16) * 4;
+        if (color) {
+          d[px] = color[0]; d[px+1] = color[1]; d[px+2] = color[2]; d[px+3] = 255;
+        } else {
+          d[px] = 0; d[px+1] = 0; d[px+2] = 0; d[px+3] = 0;
+        }
+      }
+    }
+    const offscreen = document.createElement("canvas");
+    offscreen.width = 16; offscreen.height = 16;
+    offscreen.getContext("2d").putImageData(img, 0, 0);
+    chunk.canvas = offscreen;
   }
-  chunk.imageData = img;
-
-  // Also create a scaled canvas for efficient drawImage
-  const offscreen = document.createElement("canvas");
-  offscreen.width = 16; offscreen.height = 16;
-  offscreen.getContext("2d").putImageData(img, 0, 0);
-  chunk.canvas = offscreen;
 }
 
 let drawScheduled = false;
@@ -155,27 +190,33 @@ function draw() {
   const maxCZ = Math.floor(Math.max(tlZ, brZ) / 16) + 1;
 
   // Draw chunks
-  ctx.imageSmoothingEnabled = zoom < 4;
+  ctx.imageSmoothingEnabled = atlasReady ? zoom < 1 : zoom < 4;
   for (const [key, chunk] of chunkCache) {
     const cx = chunk.cx, cz = chunk.cz;
     if (cx < minCX || cx > maxCX || cz < minCZ || cz > maxCZ) continue;
     if (!chunk.canvas) continue;
 
-    // Chunk world origin: (cx*16, cz*16). Top-left pixel of chunk on screen.
-    const [sx, sy] = worldToScreen(cx * 16, cz * 16 + 16);  // +16 because north edge
+    // Chunk world origin: top-left on screen = northwest corner = (cx*16, cz*16).
+    const [sx, sy] = worldToScreen(cx * 16, cz * 16);
     ctx.drawImage(chunk.canvas, sx, sy, chunkPx, chunkPx);
   }
 
-  // Draw grid lines at higher zoom
-  if (zoom >= 2) {
-    ctx.strokeStyle = "rgba(255,255,255,0.07)";
+  // Draw grid lines every 100 blocks
+  if (zoom >= 0.5) {
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
     ctx.lineWidth = 1;
-    for (let cx = minCX; cx <= maxCX; cx++) {
-      const [sx] = worldToScreen(cx * 16, 0);
+    const [tlWx, tlWz] = screenToWorld(0, 0);
+    const [brWx, brWz] = screenToWorld(w, h);
+    const gMinX = Math.floor(Math.min(tlWx, brWx) / 100) * 100;
+    const gMaxX = Math.ceil(Math.max(tlWx, brWx) / 100) * 100;
+    const gMinZ = Math.floor(Math.min(tlWz, brWz) / 100) * 100;
+    const gMaxZ = Math.ceil(Math.max(tlWz, brWz) / 100) * 100;
+    for (let gx = gMinX; gx <= gMaxX; gx += 100) {
+      const [sx] = worldToScreen(gx, 0);
       ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, h); ctx.stroke();
     }
-    for (let cz = minCZ; cz <= maxCZ; cz++) {
-      const [, sy] = worldToScreen(0, cz * 16);
+    for (let gz = gMinZ; gz <= gMaxZ; gz += 100) {
+      const [, sy] = worldToScreen(0, gz);
       ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(w, sy); ctx.stroke();
     }
   }
@@ -199,9 +240,9 @@ function drawPlayerMarker(sx, sy, yaw, name, isFollowed) {
   ctx.translate(sx, sy);
 
   // MC yaw: 0 = south (+Z), 90 = west (-X), 180 = north (-Z), 270 = east (+X)
-  // Screen angle: 0 = right (+X), PI/2 = down
-  // Convert: screen_angle = -(yaw + 180) in degrees, to radians
-  const angle = -(yaw + 180) * Math.PI / 180;
+  // Screen: right = east (+X), down = south (+Z)
+  // Screen angle: 0 = right, PI/2 = down
+  const angle = (yaw + 90) * Math.PI / 180;
 
   // Triangle pointing in yaw direction
   const size = Math.max(8, zoom * 2);
@@ -244,7 +285,7 @@ window.addEventListener("mousemove", e => {
   lastMouseX = e.clientX; lastMouseY = e.clientY;
   if (dragging) {
     camX = dragCamX - (e.clientX - dragStartX) / zoom;
-    camZ = dragCamZ + (e.clientY - dragStartY) / zoom;  // flip Y
+    camZ = dragCamZ - (e.clientY - dragStartY) / zoom;
   }
   updateTooltip(e.clientX, e.clientY);
   requestDraw();
@@ -262,7 +303,7 @@ canvas.addEventListener("wheel", e => {
   zoom = newZoom;
   // Adjust camera so world point under cursor stays put
   camX = wx - (e.clientX - canvas.width / 2) / zoom;
-  camZ = wz + (e.clientY - canvas.height / 2) / zoom;
+  camZ = wz - (e.clientY - canvas.height / 2) / zoom;
 
   requestDraw();
 }, { passive: false });
@@ -288,7 +329,7 @@ canvas.addEventListener("touchstart", e => {
 canvas.addEventListener("touchmove", e => {
   if (e.touches.length === 1 && dragging) {
     camX = dragCamX - (e.touches[0].clientX - dragStartX) / zoom;
-    camZ = dragCamZ + (e.touches[0].clientY - dragStartY) / zoom;
+    camZ = dragCamZ - (e.touches[0].clientY - dragStartY) / zoom;
     requestDraw();
   } else if (e.touches.length === 2) {
     const dist = Math.hypot(
@@ -398,12 +439,29 @@ function connect() {
 async function init() {
   resize();
 
-  // Load block colors
+  // Load block colors and texture atlas in parallel
   try {
-    const resp = await fetch("/block_colors.json");
-    blockColors = await resp.json();
+    const [colorsResp, atlasResp, mappingResp] = await Promise.all([
+      fetch("/block_colors.json"),
+      fetch("/texture_atlas.png"),
+      fetch("/texture_atlas.json"),
+    ]);
+    blockColors = await colorsResp.json();
+
+    if (atlasResp.ok && mappingResp.ok) {
+      const mapping = await mappingResp.json();
+      atlasBlocks = mapping.blocks || {};
+      TILE_SIZE = mapping.tile_size || 16;
+
+      const blob = await atlasResp.blob();
+      atlasImage = new Image();
+      atlasImage.src = URL.createObjectURL(blob);
+      await new Promise(resolve => { atlasImage.onload = resolve; });
+      atlasReady = true;
+      console.log("Texture atlas loaded:", Object.keys(atlasBlocks).length, "blocks");
+    }
   } catch (e) {
-    console.warn("Failed to load block colors:", e);
+    console.warn("Failed to load block colors/atlas:", e);
   }
 
   connect();
